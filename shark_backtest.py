@@ -44,6 +44,7 @@ FEE = 0.0016                   # per side fee (Shark taker ~0.16%, apne account 
 QUOTE = "USDT"                 # "USDT" ya "INR" pairs
 PRICE_TYPE = "LAST_PRICE"      # ya "MARK_PRICE"
 COINS_FILE = "shark_coins.txt"
+USE_ALL_COINS = True          # True = Shark ke exchangeInfo se SAARE coins (file ignore). False = shark_coins.txt
 CACHE_DIR = "shark_cache"
 CACHE_HOURS = 6
 
@@ -51,8 +52,9 @@ CACHE_HOURS = 6
 BASE = "https://api.sharkexchange.in"
 KLINES_PATH = "/v1/market/klines"
 EXCHANGE_INFO_PATH = "/v1/exchange/exchangeInfo"
-F_SYMBOL, F_INTERVAL, F_LIMIT = "symbol", "interval", "limit"
-F_START, F_END, F_PRICE_TYPE = "startTime", "endTime", "priceType"
+F_SYMBOL, F_INTERVAL, F_LIMIT = "pair", "interval", "limit"   # API error ne bataya: "symbol" nahi, "pair" chahiye
+F_START, F_END = "startTime", "endTime"
+F_PRICE_TYPE = None   # API ne "priceType" reject kiya. Baad me sahi naam mile to yahan daalo (None = bhejo mat)
 PAGE_LIMIT = 1000
 REQ_GAP = 1.1                  # rate limit 60 req/min
 # ======================================================
@@ -130,7 +132,9 @@ def fetch_klines(symbol, interval=TIMEFRAME, total=CANDLES_TO_FETCH, use_cache=T
     rows, end = [], int(time.time() * 1000)
     while len(rows) < total:
         body = {F_SYMBOL: symbol, F_INTERVAL: interval, F_LIMIT: PAGE_LIMIT,
-                F_START: end - PAGE_LIMIT * tf_ms, F_END: end, F_PRICE_TYPE: PRICE_TYPE}
+                F_START: end - PAGE_LIMIT * tf_ms, F_END: end}
+        if F_PRICE_TYPE:
+            body[F_PRICE_TYPE] = PRICE_TYPE
         batch = _parse(_unwrap(_request("POST", KLINES_PATH, body)))
         if not batch:
             break
@@ -175,6 +179,15 @@ def symbols_from_api():
 
 
 def get_symbols():
+    if USE_ALL_COINS:
+        try:
+            syms = symbols_from_api()
+            if syms:
+                print(f"Shark exchangeInfo se {len(syms)} {QUOTE} coins mile")
+                return syms
+            print("exchangeInfo se koi symbol nahi nikla, file try kar raha hoon")
+        except SystemExit as e:
+            print(f"{e} -> file try kar raha hoon")
     if os.path.exists(COINS_FILE):
         with open(COINS_FILE) as f:
             coins = [x.strip().upper() for x in f if x.strip() and not x.strip().startswith("#")]
@@ -194,8 +207,10 @@ def save_coins():
 def probe(sym="BTCUSDT"):
     print("== klines raw ==")
     try:
-        raw = _request("POST", KLINES_PATH, {F_SYMBOL: sym, F_INTERVAL: "1h", F_LIMIT: 5,
-                                             F_PRICE_TYPE: PRICE_TYPE})
+        body = {F_SYMBOL: sym, F_INTERVAL: "1h", F_LIMIT: 5}
+        if F_PRICE_TYPE:
+            body[F_PRICE_TYPE] = PRICE_TYPE
+        raw = _request("POST", KLINES_PATH, body)
         print(json.dumps(raw, indent=1)[:1200])
         print("parsed:", _parse(_unwrap(raw))[:2])
     except Exception as e:
@@ -377,7 +392,10 @@ def main():
     symbols = get_symbols()
     print(f"{len(symbols)} coins backtest hone hain (Shark Exchange data)")
     all_base, all_filt = [], []
+    fails = 0
     for n, sym in enumerate(symbols, 1):
+        if fails >= 3 and not all_filt:
+            raise SystemExit("Lagatar 3 coins fail hue. API request format galat lag raha hai. `probe` chalao.")
         try:
             df = fetch_klines(sym)
             if len(df) < LOOKBACK + 100:
@@ -389,8 +407,10 @@ def main():
             b["symbol"] = f["symbol"] = sym
             all_base.append(b)
             all_filt.append(f)
+            fails = 0
             print(f"[{n}/{len(symbols)}] {sym}: base {len(b)} trades, filter {len(f)} trades")
         except Exception as e:
+            fails += 1
             print(f"[{n}/{len(symbols)}] {sym} skip: {e}")
 
     base = pd.concat(all_base, ignore_index=True) if all_base else pd.DataFrame()
