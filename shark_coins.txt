@@ -1,0 +1,5 @@
+# Shark Exchange coins - ek line me ek coin (sirf naam, USDT apne aap lag jaata hai)
+# Ye sirf starter list hai. Poori 334 coins ki list ke liye chalao:  python shark_backtest.py coins
+BTC
+ETH
+SOL
