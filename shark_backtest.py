@@ -4,6 +4,7 @@ SHARK EXCHANGE - S/R FILTER BACKTEST (single file, complete)
 Kya karta hai:
   1) Shark Exchange ke public API se 1h candles lata hai (Binance ki zaroorat nahi)
   2) Signal ke time pichle 110 candles ke swing high/low se support/resistance nikalta hai
+  2b) SIGNAL = aapka Supertrend flip (1H, closed candle) - get_signal() me
   3) Long: nearest resistance entry se >= 2% door ho (target 2-3% tak jaa sake) aur
      nearest support se SL <= 1.5% ho, tabhi trade. Short ke liye ulta.
   4) Baseline (bina filter) vs Filter ke saath, dono ka backtest + per-coin report
@@ -31,10 +32,13 @@ import pandas as pd
 
 # ======================= CONFIG =======================
 TIMEFRAME = "1h"
-CANDLES_TO_FETCH = 3000        # ~125 din ka history
-LOOKBACK = 110                 # S/R ke liye last 110 candles
+LOOKBACK = 110                 # har signal pe S/R ke liye uske pichle 110 candles
+BACKTEST_CANDLES = 110         # backtest SIRF last 110 candles (~4.6 din) pe chalega
+CANDLES_TO_FETCH = LOOKBACK + BACKTEST_CANDLES + 1   # 221 (1 = abhi chal rahi candle, wo hata di jaati hai)
 PIVOT_K = 3                    # swing = left/right 3 candles se high/low
 CLUSTER_TOL = 0.004            # 0.4% ke andar ke levels merge
+ATR_PERIOD = 14                # aapke code ke hisaab se (message me '10/3' likha tha, par code 14 use karta hai)
+ATR_MULTIPLIER = 3.0
 MIN_TOUCHES = 2                # level tabhi 'asli' S/R jab kam se kam itni baar touch hua (1 = har pivot)
 TP_MIN, TP_MAX = 0.02, 0.03    # target 2% se 3%
 MAX_SL = 0.015                 # max stop loss 1.5%
@@ -45,6 +49,24 @@ QUOTE = "USDT"                 # "USDT" ya "INR" pairs
 PRICE_TYPE = "LAST_PRICE"      # ya "MARK_PRICE"
 COINS_FILE = "shark_coins.txt"
 USE_ALL_COINS = True          # True = Shark ke exchangeInfo se SAARE coins (file ignore). False = shark_coins.txt
+ONLY_ALLOWED_COINS = True      # True = sirf neeche wali aapki 334 coins ki list (Shark pe jo available ho). False = Shark ke SAARE coins
+ALLOWED_COINS = {x.upper() for x in """
+BTC ETH SOL XRP DOGE 1000PEPE 1000SHIB Orca Alch Bless Esp Solv Space 1mbabydoge 1000bonk Bas Manta Wlfi Rsr Xtz Bera
+Goat Kaito Cat Pendle Ake Gmt Rave Ray Auction Bluai Xpl Wif Cgpt Meta Meme Pump Lpt Mew Fartcoin Ar Imx Chip Polyx
+River Glm Flow Skhynix 1000sats Arc Ava Cetus Gas Sand Apt Ena Crv Linea Arkm Jellyjelly Zrx Evaa Xaut TRX Moca Aster
+Hype Kaia Atom Cheems S W Light Xny Mina Link Kite Tst Coin Chillguy Usual Act Awe Cyber Cl Xmr Sapien Avnt Bz VVV Skl
+Rez Red People Xag At Cookie Clo Pha Baba Siren Lit Zk Ltc Aztec Wal Folks Inj Flux Jasmy Fil Dym 1000floki Og Op Vana
+Lumia Nmr Alt Hbar Aave Ape Uai Pnut Xan Giggle Celo Prom Sei Lab Tao Xau G Velodrome Zora Hmstr Axs Googl Lyn Rare Not
+Plume Uni Bard Nil Spk Sqd Tut Spell Xpd Trump Bio Amd Bmt Hana Cys Dram Coti Merl Form Somi Koma Sndk Samsung Xvg Aero
+Move Band Pltr Trb Mmt Xlm Moodeng Virtual Vet Lista Pengu Jct Etc Cati Hood Melania Kas Soxl Vtho Grass Natgas Enso
+Banana Zen 2z Morpho Rvn Tsla Swarms Render Zec Mon Xpt Arb Dash Skyai Tia Mu B2 Mstr Msft Pyth Koru Xai Myx Intc Irys
+Zil Neo Tnsr Mubarak Fet Nvda AMZN Bat Ta Pons Soon Crcl Dood Dexe Anime Marscoin Spcx Bnb Trust Flock Pol Turtle Ens
+Dogs Turbo Resolv Avax Sto Cbrs Wld Near H Dot Gala Jup Magic Gua 1000000mog Spx Sahara Zro Cake Strk Theta Comp Akt Cow
+Rune Enj Ldo Useless Eigen Ban Allo Paxg Mavia Recall Prompt Bome Tlm Pixel Ada Popcat ICP Syn Mask Saga 1000rats Stbl
+Beat Take Esports Met Ethfi Cfx Ondo Fhe Io Pippin Fida Pieverse Bananas31 Wct Snx Sui Tradoor Br Dia Agld Coai Algo 4
+Parti Neirocto Egld Santos Brett Ordi M Aevo Kgen Xpin Api3 Drift Yb Apr Ub Hemi Bb Bch Jto Grt The Eul Mito Zerebro
+Aixbt Wmt Griffain Ace Safe
+""".split()}
 CACHE_DIR = "shark_cache"
 CACHE_HOURS = 6
 
@@ -56,7 +78,8 @@ F_SYMBOL, F_INTERVAL, F_LIMIT = "pair", "interval", "limit"   # API error ne bat
 F_START, F_END = "startTime", "endTime"
 F_PRICE_TYPE = None   # API ne "priceType" reject kiya. Baad me sahi naam mile to yahan daalo (None = bhejo mat)
 PAGE_LIMIT = 1000
-REQ_GAP = 1.1                  # rate limit 60 req/min
+REQ_GAP = 0.25                 # request ke beech gap (sec). 429 aaye to code khud badha deta hai (max 1.1 = 60 req/min)
+MAX_COINS = 0                  # 0 = saare coins. Jaldi test ke liye 20-30 likho
 # ======================================================
 
 _last_call = [0.0]
@@ -72,11 +95,14 @@ def _throttle():
 
 
 def _request(method, path, body=None):
-    for _ in range(3):
+    global REQ_GAP
+    for _ in range(6):
         _throttle()
         r = requests.request(method, BASE + path, json=body if method == "POST" else None, timeout=20)
         if r.status_code == 429:
-            time.sleep(30)
+            REQ_GAP = min(REQ_GAP * 2, 1.1)   # server ne roka -> dheema karo
+            print(f"  429 rate limit, gap ab {REQ_GAP:.2f}s, 10s ruk raha hoon")
+            time.sleep(10)
             continue
         if not r.ok:
             raise RuntimeError(f"{method} {path} -> {r.status_code}: {r.text[:300]}")
@@ -131,8 +157,9 @@ def fetch_klines(symbol, interval=TIMEFRAME, total=CANDLES_TO_FETCH, use_cache=T
     tf_ms = TF_SECONDS[interval] * 1000
     rows, end = [], int(time.time() * 1000)
     while len(rows) < total:
-        body = {F_SYMBOL: symbol, F_INTERVAL: interval, F_LIMIT: PAGE_LIMIT,
-                F_START: end - PAGE_LIMIT * tf_ms, F_END: end}
+        want = min(PAGE_LIMIT, total - len(rows) + 5)      # sirf utne candles maango jitne chahiye
+        body = {F_SYMBOL: symbol, F_INTERVAL: interval, F_LIMIT: want,
+                F_START: end - want * tf_ms, F_END: end}
         if F_PRICE_TYPE:
             body[F_PRICE_TYPE] = PRICE_TYPE
         batch = _parse(_unwrap(_request("POST", KLINES_PATH, body)))
@@ -140,7 +167,7 @@ def fetch_klines(symbol, interval=TIMEFRAME, total=CANDLES_TO_FETCH, use_cache=T
             break
         rows += batch
         earliest = min(b[0] for b in batch)
-        if earliest >= end:
+        if earliest >= end or len(batch) < want * 0.5:   # aur data hai hi nahi -> extra request mat karo
             break
         end = earliest - 1
 
@@ -178,7 +205,19 @@ def symbols_from_api():
     return sorted(s for s in found if s.endswith(QUOTE))
 
 
+def _apply_allowed(syms):
+    if not ONLY_ALLOWED_COINS:
+        return syms
+    keep = [x for x in syms if x[: -len(QUOTE)] in ALLOWED_COINS or x.endswith("INR") and x[:-3] in ALLOWED_COINS]
+    print(f"ALLOWED_COINS filter: {len(syms)} me se {len(keep)} bache")
+    return keep
+
+
 def get_symbols():
+    return _apply_allowed(_get_symbols_raw())
+
+
+def _get_symbols_raw():
     if USE_ALL_COINS:
         try:
             syms = symbols_from_api()
@@ -273,16 +312,58 @@ def sr_filter(window, entry, side):
     return True, tp, sl
 
 
-# ---------------- APNA SIGNAL YAHAN DAALO ----------------
+# ---------------- AAPKA SUPERTREND SIGNAL ----------------
+def supertrend(df, period=ATR_PERIOD, multiplier=ATR_MULTIPLIER):
+    """Aapke code ka same Supertrend (RMA-ATR), bas numpy me taaki tez chale.
+    direction: 1 = upper band (down trend), -1 = lower band (up trend)."""
+    high, low, close = df["high"].values, df["low"].values, df["close"].values
+    n = len(df)
+    pc = np.concatenate([[np.nan], close[:-1]])
+    tr = np.nanmax(np.vstack([high - low, np.abs(high - pc), np.abs(low - pc)]), axis=0)
+
+    atr = np.full(n, np.nan)
+    if n >= period:
+        atr[period - 1] = tr[:period].mean()
+        for i in range(period, n):
+            atr[i] = atr[i - 1] + (tr[i] - atr[i - 1]) / period
+
+    hl2 = (high + low) / 2.0
+    upper, lower = hl2 + multiplier * atr, hl2 - multiplier * atr
+    fu, fl = np.full(n, np.nan), np.full(n, np.nan)
+    direction, st = np.zeros(n, dtype=int), np.full(n, np.nan)
+
+    for i in range(n):
+        if np.isnan(atr[i]) or i == period - 1:
+            fu[i], fl[i], direction[i], st[i] = upper[i], lower[i], 1, upper[i]
+            continue
+        fl[i] = lower[i] if (lower[i] > fl[i - 1] or close[i - 1] < fl[i - 1]) else fl[i - 1]
+        fu[i] = upper[i] if (upper[i] < fu[i - 1] or close[i - 1] > fu[i - 1]) else fu[i - 1]
+        if direction[i - 1] == 1:
+            direction[i] = -1 if close[i] > fu[i] else 1
+        else:
+            direction[i] = 1 if close[i] < fl[i] else -1
+        st[i] = fl[i] if direction[i] == -1 else fu[i]
+    return direction, st
+
+
+def add_indicators(df):
+    df["st_dir"], df["st"] = supertrend(df)
+    return df
+
+
 def get_signal(df, i):
-    """Example: EMA20/EMA50 crossover. Isko apne signal logic se replace karo.
-    Return 'long', 'short' ya None. Sirf df.iloc[:i+1] ka data use karna (no lookahead)."""
-    if i < 1:
+    """Aapke scanner jaisa: closed candle i pe Supertrend flip.
+    BUY (long)  : prev_close <= prev_ST, close > ST, direction == -1
+    SELL (short): prev_close >= prev_ST, close < ST, direction == 1"""
+    if i < 2:
         return None
-    f, s = df["ema20"], df["ema50"]
-    if f.iloc[i - 1] <= s.iloc[i - 1] and f.iloc[i] > s.iloc[i]:
+    pc, pst = df["close"].iloc[i - 1], df["st"].iloc[i - 1]
+    cc, cst, cd = df["close"].iloc[i], df["st"].iloc[i], df["st_dir"].iloc[i]
+    if np.isnan(pst) or np.isnan(cst):
+        return None
+    if pc <= pst and cc > cst and cd == -1:
         return "long"
-    if f.iloc[i - 1] >= s.iloc[i - 1] and f.iloc[i] < s.iloc[i]:
+    if pc >= pst and cc < cst and cd == 1:
         return "short"
     return None
 # ---------------------------------------------------------
@@ -312,7 +393,7 @@ def simulate(df, i, side, entry, tp, sl):
 
 def run_backtest(df, use_filter=True):
     trades = []
-    i = LOOKBACK
+    i = max(LOOKBACK, len(df) - BACKTEST_CANDLES)   # sirf last BACKTEST_CANDLES me signal dhoondho
     while i < len(df) - 1:
         side = get_signal(df, i)
         if side is None:
@@ -350,29 +431,37 @@ def report(name, tr):
     print(f"Avg bars held: {tr['bars_held'].mean():.1f}")
 
 
+def load_df(sym):
+    df = fetch_klines(sym)
+    tf_ms = TF_SECONDS[TIMEFRAME] * 1000
+    if df["ts"].iloc[-1] + tf_ms > time.time() * 1000:   # abhi chal rahi (adhuri) candle hata do
+        df = df.iloc[:-1]
+    df = df.reset_index(drop=True)
+    if len(df) >= LOOKBACK + 30:
+        add_indicators(df)
+    return df
+
+
 def scan():
     """Har coin ke SIRF last 110 closed candles lo, abhi ke candle pe signal + S/R filter check karo."""
     symbols = get_symbols()
+    if MAX_COINS:
+        symbols = symbols[:MAX_COINS]
     tf_ms = TF_SECONDS[TIMEFRAME] * 1000
-    print(f"{len(symbols)} coins scan hone hain (har coin ke last {LOOKBACK} candles)")
+    print(f"{len(symbols)} coins scan hone hain (Supertrend signal + S/R filter, last candle pe)")
     rows = []
     for n, sym in enumerate(symbols, 1):
         try:
-            df = fetch_klines(sym, TIMEFRAME, LOOKBACK + 1, use_cache=False)
-            if df["ts"].iloc[-1] + tf_ms > time.time() * 1000:  # abhi chal rahi candle hata do
-                df = df.iloc[:-1]
-            df = df.tail(LOOKBACK).reset_index(drop=True)
-            if len(df) < LOOKBACK:
+            df = load_df(sym)
+            if len(df) < LOOKBACK + 30:
                 print(f"[{n}/{len(symbols)}] {sym}: sirf {len(df)} candles mili, skip")
                 continue
-            df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
-            df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
             i = len(df) - 1
             side = get_signal(df, i)
             if side is None:
                 continue
             entry = df["close"].iloc[i]
-            ok, tp, sl = sr_filter(df, entry, side)
+            ok, tp, sl = sr_filter(df.iloc[i - LOOKBACK + 1: i + 1], entry, side)
             if ok:
                 rows.append({"symbol": sym, "side": side, "entry": entry, "tp": tp, "sl": sl,
                              "tp_pct": abs(tp - entry) / entry * 100, "sl_pct": abs(sl - entry) / entry * 100,
@@ -390,6 +479,8 @@ def scan():
 
 def main():
     symbols = get_symbols()
+    if MAX_COINS:
+        symbols = symbols[:MAX_COINS]
     print(f"{len(symbols)} coins backtest hone hain (Shark Exchange data)")
     all_base, all_filt = [], []
     fails = 0
@@ -397,12 +488,10 @@ def main():
         if fails >= 3 and not all_filt:
             raise SystemExit("Lagatar 3 coins fail hue. API request format galat lag raha hai. `probe` chalao.")
         try:
-            df = fetch_klines(sym)
-            if len(df) < LOOKBACK + 100:
+            df = load_df(sym)
+            if len(df) < LOOKBACK + 30:
                 print(f"[{n}/{len(symbols)}] {sym}: data kam hai, skip")
                 continue
-            df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
-            df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
             b, f = run_backtest(df, False), run_backtest(df, True)
             b["symbol"] = f["symbol"] = sym
             all_base.append(b)
