@@ -391,24 +391,31 @@ def calculate_gross_pnl(side, entry_price, exit_price):
 
 def find_setup(df, events, i):
     """
-    Signal uses reversal levels that had already APPEARED before
-    the signal candle. We never use an event that appears later.
+    Entry logic kept aligned with the original successful setup:
+    use an already-confirmed REGULAR LuxAlgo pivot as support/resistance,
+    require a bullish/bearish confirmation candle, then enter on the
+    next candle when the confirmation high/low breaks.
+
+    IMPORTANT: missed/dynamic reversals are NOT used to manufacture the
+    entry signal. They are reserved for the post-entry target logic.
     """
     if i < 1:
         return None
 
     row = df.iloc[i]
 
+    # Look back far enough to retain the latest confirmed structural
+    # pivot. No future event is allowed.
     recent = [
         e for e in events
-        if i - 10 <= e["appearance_index"] <= i
-        and e["appearance_index"] <= i
+        if e["appearance_index"] <= i
+        and e["appearance_index"] >= max(0, i - 500)
     ]
 
-    # Long: a missed/dynamic low is support.
+    # LONG: regular pivot low = support.
     low_events = [
         e for e in recent
-        if e["type"] == "missed_low"
+        if e["type"] == "regular_low"
         and e["price"] <= float(row["high"])
     ]
 
@@ -425,14 +432,15 @@ def find_setup(df, events, i):
                 "side": "LONG",
                 "signal_index": i,
                 "level": level,
+                "level_type": "regular_low",
                 "confirmation_high": float(row["high"]),
                 "stop_loss": float(row["low"]),
             }
 
-    # Short: a missed/dynamic high is resistance.
+    # SHORT: regular pivot high = resistance.
     high_events = [
         e for e in recent
-        if e["type"] == "missed_high"
+        if e["type"] == "regular_high"
         and e["price"] >= float(row["low"])
     ]
 
@@ -449,12 +457,12 @@ def find_setup(df, events, i):
                 "side": "SHORT",
                 "signal_index": i,
                 "level": level,
+                "level_type": "regular_high",
                 "confirmation_low": float(row["low"]),
                 "stop_loss": float(row["high"]),
             }
 
     return None
-
 
 def first_dynamic_target_after_entry(events, entry_index, entry_price, side):
     """
@@ -678,6 +686,8 @@ def simulate_trade(
         "entry_time": df["timestamp"].iloc[entry_index],
         "entry_price": entry_price,
         "stop_loss": stop_loss,
+        "entry_level": setup.get("level"),
+        "entry_level_type": setup.get("level_type"),
         "target": target,
         "target_created_index": target_created_index,
         "target_created_time": target_created_time,
@@ -853,7 +863,7 @@ def validate_trades(trades):
 
 def print_results(trades, summary):
     print("\n" + "=" * 80)
-    print("LUXALGO FIRST DYNAMIC REVERSAL BACKTEST")
+    print("LUXALGO REGULAR-PIVOT ENTRY + FIRST DYNAMIC REVERSAL TARGET BACKTEST")
     print("=" * 80)
 
     row = summary.iloc[0]
@@ -891,6 +901,8 @@ def print_results(trades, summary):
         "side",
         "entry_time",
         "entry_price",
+        "entry_level",
+        "entry_level_type",
         "stop_loss",
         "target",
         "target_created_time",
@@ -975,7 +987,7 @@ def main():
     args = parser.parse_args()
 
     print("\n" + "=" * 80)
-    print("LUXALGO FIRST DYNAMIC REVERSAL BACKTEST")
+    print("LUXALGO REGULAR-PIVOT ENTRY + FIRST DYNAMIC REVERSAL TARGET BACKTEST")
     print("=" * 80)
     print("Pair        :", args.pair)
     print("Days        :", args.days)
@@ -985,7 +997,8 @@ def main():
     print("Margin      :", f"₹{MARGIN:.2f}")
     print("Leverage    :", f"{LEVERAGE:.1f}x")
     print("Notional    :", f"₹{NOTIONAL:.2f}")
-    print("Target      :", "FIRST MISSED REVERSAL AFTER ENTRY — LOCKED")
+    print("Entry       :", "CONFIRMED REGULAR PIVOT + CONFIRMATION CANDLE")
+    print("Target      :", "FIRST MISSED/DYNAMIC REVERSAL AFTER ENTRY — LOCKED")
 
     df = download_history(
         args.pair,
