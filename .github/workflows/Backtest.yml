@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       pair:
-        description: "USDT Pair (e.g. BTCUSDT)"
+        description: "USDT Pair"
         required: true
         default: "BTCUSDT"
 
@@ -14,7 +14,7 @@ on:
         default: "30"
 
       price:
-        description: "Candle price type"
+        description: "Price type"
         required: true
         type: choice
         default: "LAST_PRICE"
@@ -24,104 +24,59 @@ on:
           - INDEX_PRICE
 
       leverage:
-        description: "Leverage (x)"
+        description: "Leverage"
         required: false
         default: "10"
 
       margin:
-        description: "Margin per trade (Rs)"
+        description: "Margin"
         required: false
         default: "1000"
 
       stop_loss:
-        description: "Stop-loss % of price (0 = OFF)"
+        description: "Stop Loss %"
         required: false
         default: "0"
 
       first_exchange:
-        description: "Preferred exchange (optional)"
+        description: "First Exchange"
         required: false
         default: ""
 
       length:
-        description: "Pivot length"
+        description: "Pivot Length"
         required: false
         default: "50"
 
-
 jobs:
-
   backtest:
-
     runs-on: ubuntu-latest
 
     steps:
-
-      # ==================================================
-      # CHECKOUT
-      # ==================================================
-
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
-
-
-      # ==================================================
-      # PYTHON
-      # ==================================================
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-
-      # ==================================================
-      # INSTALL
-      # ==================================================
-
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install pandas numpy ccxt matplotlib
 
-
-      # ==================================================
-      # RUN BACKTEST
-      # ==================================================
-
       - name: Run backtest
-        shell: bash
         run: |
-
-          set -e
-
-          echo "=========================================="
-          echo "Repository files"
-          echo "=========================================="
+          echo "======================================"
+          echo "RUNNING PIVOT BACKTEST"
+          echo "======================================"
 
           ls -lah
 
-          echo ""
-          echo "=========================================="
-          echo "Checking Python file"
-          echo "=========================================="
+          test -f "./pivot_backtest.py"
 
-          if [ ! -f "./pivot_backtest.py" ]; then
-            echo "ERROR: pivot_backtest.py nahi mili."
-            echo ""
-            echo "Available files:"
-            ls -lah
-            exit 1
-          fi
-
-          echo "Using Python file: ./pivot_backtest.py"
-
-          echo ""
-          echo "=========================================="
-          echo "Running backtest"
-          echo "=========================================="
-
-          python ./pivot_backtest.py \
+          python "./pivot_backtest.py" \
             --pair "${{ inputs.pair }}" \
             --days "${{ inputs.days }}" \
             --price "${{ inputs.price }}" \
@@ -131,50 +86,12 @@ jobs:
             --first "${{ inputs.first_exchange }}" \
             --length "${{ inputs.length }}"
 
-
-      # ==================================================
-      # CHECK OUTPUT
-      # ==================================================
-
-      - name: Check results
-        shell: bash
-        run: |
-
-          echo "=========================================="
-          echo "Checking output files"
-          echo "=========================================="
-
           echo ""
+          echo "======================================"
+          echo "OUTPUT FILES"
+          echo "======================================"
 
-          if [ -f "backtest_summary.csv" ]; then
-            echo "OK: backtest_summary.csv"
-          else
-            echo "ERROR: backtest_summary.csv missing"
-            exit 1
-          fi
-
-          if [ -f "backtest_all_trades.csv" ]; then
-            echo "OK: backtest_all_trades.csv"
-          else
-            echo "ERROR: backtest_all_trades.csv missing"
-            exit 1
-          fi
-
-          if [ -f "equity_all.png" ]; then
-            echo "OK: equity_all.png"
-          else
-            echo "WARNING: equity_all.png missing"
-          fi
-
-          echo ""
-          echo "=========================================="
-          echo "BACKTEST COMPLETED"
-          echo "=========================================="
-
-
-      # ==================================================
-      # UPLOAD RESULTS
-      # ==================================================
+          ls -lah *.csv *.png 2>/dev/null || true
 
       - name: Upload results
         uses: actions/upload-artifact@v4
