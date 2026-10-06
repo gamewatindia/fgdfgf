@@ -18,10 +18,12 @@ LEV = 10                    # leverage
 MMR = 0.005                 # maintenance margin (0.5%)
 FEE_PCT = 0.10              # % per side, on full position size
 TFS = ["5m", "15m", "30m", "1h", "4h"]
-EXCHANGES = {                # tried in order until one works
-    "LAST_PRICE": ["binanceus", "bybit", "okx"],
-    "MARK_PRICE": ["bybit", "okx", "binanceusdm"],
-    "INDEX_PRICE": ["bybit", "okx", "binanceusdm"],
+# Tried in order until one has the pair. (bybit/binance.com block GitHub's US servers,
+# so they are kept last; gateio/mexc/kucoin/bitget list far more altcoins.)
+EXCHANGES = {
+    "LAST_PRICE": ["binanceus", "gateio", "mexc", "kucoin", "bitget", "okx", "bybit"],
+    "MARK_PRICE": ["gateio", "bitget", "okx", "bybit", "binanceusdm", "kucoinfutures"],
+    "INDEX_PRICE": ["gateio", "bitget", "okx", "bybit", "binanceusdm"],
 }
 
 
@@ -34,10 +36,11 @@ def norm_pair(p):
     return p
 
 
-def fetch(pair, tf, days, warmup, price):
+def fetch(pair, tf, days, warmup, price, first=""):
     import ccxt
     errs = []
-    for name in EXCHANGES[price]:
+    order = ([first] if first else []) + [e for e in EXCHANGES[price] if e != first]
+    for name in order:
         try:
             ex = getattr(ccxt, name)({"enableRateLimit": True})
             ex.load_markets()
@@ -68,7 +71,7 @@ def fetch(pair, tf, days, warmup, price):
             print(f"[{tf}] data: {name} {sym} {price} ({len(df)} candles)")
             return df.drop_duplicates("time").sort_values("time").reset_index(drop=True)
         except Exception as e:
-            errs.append(f"{name}: {str(e)[:80]}")
+            errs.append(f"{name}: {str(e)[:60]}")
     raise RuntimeError(" | ".join(errs))
 
 
@@ -170,6 +173,7 @@ if __name__ == "__main__":
     ap.add_argument("--price", default="LAST_PRICE", choices=list(EXCHANGES))
     ap.add_argument("--length", type=int, default=50)
     ap.add_argument("--tfs", default=",".join(TFS))
+    ap.add_argument("--first", default="", help="preferred exchange tried first (ccxt id)")
     ap.add_argument("--lev", type=float, default=10)
     ap.add_argument("--margin", type=float, default=1000)
     a = ap.parse_args()
@@ -179,14 +183,14 @@ if __name__ == "__main__":
     all_tr, rows = [], []
     for tf in a.tfs.split(","):
         try:
-            df = fetch(pair, tf, a.days, 2 * a.length + 5, a.price)
+            df = fetch(pair, tf, a.days, 2 * a.length + 5, a.price, a.first.strip().lower())
             tr, npv = backtest(df, a.length, a.days, tf)
             rows.append(summarize(tf, tr, npv))
             if not tr.empty:
                 all_tr.append(tr)
         except Exception as e:
             print(f"[{tf}] ERROR: {e}")
-            rows.append(summarize(tf, pd.DataFrame(), 0, "ERROR: " + str(e)[:120]))
+            rows.append(summarize(tf, pd.DataFrame(), 0, "ERROR: " + str(e)[:300]))
 
     sm = pd.DataFrame(rows)
     print("\n" + "=" * 78)
