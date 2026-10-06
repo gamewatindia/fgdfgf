@@ -39,7 +39,7 @@ on:
         default: "0"
 
       first_exchange:
-        description: "Preferred exchange (optional)"
+        description: "Preferred exchange (optional, e.g. gateio)"
         required: false
         default: ""
 
@@ -50,7 +50,6 @@ on:
 
 
 jobs:
-
   backtest:
 
     runs-on: ubuntu-latest
@@ -73,7 +72,7 @@ jobs:
           pip install pandas numpy ccxt matplotlib
 
 
-      - name: Find and run pivot backtest
+      - name: Run pivot backtest
         shell: bash
         run: |
 
@@ -87,13 +86,13 @@ jobs:
 
           echo ""
           echo "=========================================="
-          echo "Finding Python backtest file"
+          echo "Checking pivot_backtest"
           echo "=========================================="
 
-          FILE=$(find . -maxdepth 1 -type f -iname '*pivot*backtest*.py' | head -n 1)
+          FILE="./pivot_backtest"
 
-          if [ -z "$FILE" ]; then
-            echo "ERROR: Pivot backtest Python file nahi mili."
+          if [ ! -f "$FILE" ]; then
+            echo "ERROR: pivot_backtest file nahi mili."
             echo ""
             echo "Available files:"
             ls -lah
@@ -114,46 +113,4 @@ jobs:
             --lev "${{ github.event.inputs.leverage }}" \
             --margin "${{ github.event.inputs.margin }}" \
             --sl "${{ github.event.inputs.stop_loss }}" \
-            --first "${{ github.event.inputs.first_exchange }}" \
-            --length "${{ github.event.inputs.length }}"
-
-          echo ""
-          echo "=========================================="
-          echo "Checking output files"
-          echo "=========================================="
-
-          if [ ! -f "backtest_summary.csv" ]; then
-            echo "ERROR: backtest_summary.csv nahi bani."
-            exit 1
-          fi
-
-          if [ ! -f "backtest_all_trades.csv" ]; then
-            echo "ERROR: backtest_all_trades.csv nahi bani."
-            exit 1
-          fi
-
-          if [ ! -f "equity_all.png" ]; then
-            echo "ERROR: equity_all.png nahi bani."
-            exit 1
-          fi
-
-          echo ""
-          echo "=========================================="
-          echo "BACKTEST COMPLETED SUCCESSFULLY"
-          echo "=========================================="
-
-          ls -lh \
-            backtest_summary.csv \
-            backtest_all_trades.csv \
-            equity_all.png
-
-
-      - name: Upload results
-        uses: actions/upload-artifact@v4
-        with:
-          name: backtest-results
-          path: |
-            backtest_summary.csv
-            backtest_all_trades.csv
-            equity_all.png
-          if-no-files-found: error
+            --first "${{ github.event
