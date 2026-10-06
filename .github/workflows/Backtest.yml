@@ -34,7 +34,7 @@ on:
         default: "1000"
 
       stop_loss:
-        description: "Stop-loss % of price (0 = off, e.g. 4 for 10x)"
+        description: "Stop-loss % of price (0 = off)"
         required: false
         default: "0"
 
@@ -50,24 +50,23 @@ on:
 
 
 jobs:
-
   backtest:
 
     runs-on: ubuntu-latest
 
     steps:
 
-      # ==================================================
+      # ================================================
       # CHECKOUT
-      # ==================================================
+      # ================================================
 
       - name: Checkout repository
         uses: actions/checkout@v4
 
 
-      # ==================================================
+      # ================================================
       # PYTHON
-      # ==================================================
+      # ================================================
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -75,9 +74,9 @@ jobs:
           python-version: "3.11"
 
 
-      # ==================================================
-      # DEPENDENCIES
-      # ==================================================
+      # ================================================
+      # INSTALL DEPENDENCIES
+      # ================================================
 
       - name: Install dependencies
         run: |
@@ -85,9 +84,9 @@ jobs:
           pip install pandas numpy ccxt matplotlib
 
 
-      # ==================================================
+      # ================================================
       # RUN BACKTEST
-      # ==================================================
+      # ================================================
 
       - name: Run backtest (all 5 timeframes)
         shell: bash
@@ -96,22 +95,20 @@ jobs:
           set -e
 
           echo "=========================================="
-          echo "Repository files:"
+          echo "Repository files"
           echo "=========================================="
 
           ls -lah
 
           echo ""
           echo "=========================================="
-          echo "Finding pivot backtest Python file..."
+          echo "Checking backtest script"
           echo "=========================================="
 
-          FILE=$(find . -maxdepth 1 -type f \
-            \( -iname 'pivot_backtest.py' -o -iname 'pivot*backtest*.py' \) \
-            | head -n 1)
+          FILE="./luxalgo_backtest.py"
 
-          if [ -z "$FILE" ]; then
-            echo "ERROR: pivot_backtest.py nahi mili."
+          if [ ! -f "$FILE" ]; then
+            echo "ERROR: luxalgo_backtest.py nahi mili."
             echo ""
             echo "Available files:"
             ls -lah
@@ -141,31 +138,34 @@ jobs:
           echo "=========================================="
 
           if [ ! -f "backtest_summary.csv" ]; then
-            echo "ERROR: backtest_summary.csv create nahi hui."
+            echo "ERROR: backtest_summary.csv nahi bani."
             exit 1
           fi
 
           if [ ! -f "backtest_all_trades.csv" ]; then
-            echo "ERROR: backtest_all_trades.csv create nahi hui."
+            echo "ERROR: backtest_all_trades.csv nahi bani."
             exit 1
           fi
 
           if [ ! -f "equity_all.png" ]; then
-            echo "ERROR: equity_all.png create nahi hui."
+            echo "ERROR: equity_all.png nahi bani."
             exit 1
           fi
 
           echo ""
-          echo "All output files successfully created:"
+          echo "=========================================="
+          echo "BACKTEST COMPLETED SUCCESSFULLY"
+          echo "=========================================="
+
           ls -lh \
             backtest_summary.csv \
             backtest_all_trades.csv \
             equity_all.png
 
 
-      # ==================================================
+      # ================================================
       # UPLOAD RESULTS
-      # ==================================================
+      # ================================================
 
       - name: Upload results
         uses: actions/upload-artifact@v4
