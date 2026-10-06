@@ -1,0 +1,184 @@
+"""
+Pivot High/Low (LuxAlgo-style) Backtest
+---------------------------------------
+Strategy (stop-and-reverse):
+  - Confirmed Pivot LOW  (▲) -> go LONG  (close any short)
+  - Confirmed Pivot HIGH (▼) -> go SHORT (close any long)
+  - Entry price = close of the bar on which the pivot gets CONFIRMED
+    (pivot is confirmed `length` bars late, so NO look-ahead / repaint).
+  - Fixed Rs 1000 per trade, fee per side configurable.
+  - Only trades entered in the last DAYS days are counted.
+
+Note: only regular (confirmed) pivots are traded. The 👻 missed pivots and
+ghost levels are drawn on the last leg / repaint, so they are not used here.
+
+Install:  pip install pandas numpy ccxt matplotlib
+Run:      python pivot_backtest.py
+          python pivot_backtest.py --symbol ETH/USDT --tf 15m --length 50
+          python pivot_backtest.py --csv mydata.csv   (cols: time,open,high,low,close)
+"""
+import argparse
+import time
+import numpy as np
+import pandas as pd
+
+# ---------------- settings ----------------
+CAPITAL_PER_TRADE = 1000.0   # Rs per trade
+FEE_PCT = 0.10               # % per side (exchange fee); set 0 to ignore
+# ------------------------------------------
+
+
+def fetch_ohlcv(symbol, tf, days, warmup_bars, exchange="binance"):
+    import ccxt
+    ex = getattr(ccxt, exchange)({"enableRateLimit": True})
+    tf_ms = ex.parse_timeframe(tf) * 1000
+    since = ex.milliseconds() - days * 86400 * 1000 - warmup_bars * tf_ms
+    rows = []
+    while True:
+        batch = ex.fetch_ohlcv(symbol, tf, since=since, limit=1000)
+        if not batch:
+            break
+        rows += batch
+        since = batch[-1][0] + tf_ms
+        if len(batch) < 1000:
+            break
+        time.sleep(ex.rateLimit / 1000)
+    df = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "vol"])
+    df["time"] = pd.to_datetime(df["time"], unit="ms")
+    return df.drop_duplicates("time").reset_index(drop=True)
+
+
+def load_csv(path):
+    df = pd.read_csv(path)
+    df.columns = [c.lower() for c in df.columns]
+    df["time"] = pd.to_datetime(df["time"])
+    return df.reset_index(drop=True)
+
+
+def backtest(df, length, days):
+    high, low, close = df["high"].values, df["low"].values, df["close"].values
+    times = df["time"]
+    cutoff = times.iloc[-1] - pd.Timedelta(days=days)
+
+    trades = []
+    pos = 0            # 1 long, -1 short, 0 flat
+    entry_px = entry_t = None
+    n_pivots = 0
+
+    def close_trade(exit_px, exit_t, status="closed"):
+        nonlocal pos, entry_px, entry_t
+        gross = CAPITAL_PER_TRADE * pos * (exit_px / entry_px - 1)
+        fees = CAPITAL_PER_TRADE * (FEE_PCT / 100) * 2
+        trades.append({
+            "side": "LONG" if pos == 1 else "SHORT",
+            "entry_time": entry_t, "entry_price": entry_px,
+            "exit_time": exit_t, "exit_price": exit_px,
+            "gross_pnl": round(gross, 2), "fees": round(fees, 2),
+            "net_pnl": round(gross - fees, 2), "status": status,
+        })
+
+    for i in range(2 * length, len(df)):
+        c = i - length                       # candidate pivot bar
+        win_h = high[c - length: i + 1]
+        win_l = low[c - length: i + 1]
+        is_ph = high[c] == win_h.max() and (win_h == high[c]).sum() == 1
+        is_pl = low[c] == win_l.min() and (win_l == low[c]).sum() == 1
+        if not (is_ph or is_pl):
+            continue
+        if times.iloc[i] < cutoff:           # outside the 30-day window
+            continue
+        n_pivots += 1
+        new_dir = -1 if is_ph else 1         # ph -> short, pl -> long
+        if new_dir == pos:
+            continue
+        if pos != 0:
+            close_trade(close[i], times.iloc[i])
+        pos, entry_px, entry_t = new_dir, close[i], times.iloc[i]
+
+    if pos != 0:                             # mark-to-market last open trade
+        close_trade(close[-1], times.iloc[-1], status="open (MTM)")
+
+    return pd.DataFrame(trades), n_pivots
+
+
+def write_gh_summary(tr, n_pivots, args, dd, gp, gl):
+    """GitHub Actions ke Summary tab me ek row likhta hai (local par skip)."""
+    import os
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    wins = (tr.net_pnl > 0).sum()
+    pf = f"{gp/gl:.2f}" if gl else "inf"
+    with open(path, "a") as f:
+        f.write(f"### {args.symbol} | {args.tf} | length {args.length}\n\n")
+        f.write("| Trades | Win% | Net P&L (Rs) | Fees (Rs) | Profit Factor | Max DD (Rs) |\n")
+        f.write("|---|---|---|---|---|---|\n")
+        f.write(f"| {len(tr)} | {wins/len(tr)*100:.1f}% | {tr.net_pnl.sum():.2f} | "
+                f"{tr.fees.sum():.2f} | {pf} | {dd:.2f} |\n\n")
+
+
+def report(tr, n_pivots, args):
+    print("=" * 60)
+    print(f"Pivot Backtest | {args.symbol if not args.csv else args.csv} | "
+          f"{args.tf} | length={args.length} | last {args.days} days")
+    print(f"Capital/trade: Rs {CAPITAL_PER_TRADE:.0f} | Fee/side: {FEE_PCT}%")
+    print("=" * 60)
+    if tr.empty:
+        print("Koi trade execute nahi hua. Length chhota karo (e.g. 20) "
+              "ya timeframe chhota karo (e.g. 5m).")
+        return
+    wins = tr[tr.net_pnl > 0]
+    losses = tr[tr.net_pnl <= 0]
+    eq = tr.net_pnl.cumsum()
+    dd = (eq - eq.cummax()).min()
+    gp, gl = wins.net_pnl.sum(), abs(losses.net_pnl.sum())
+    print(f"Pivots confirmed (window) : {n_pivots}")
+    print(f"Total trades executed     : {len(tr)}  "
+          f"(LONG {sum(tr.side=='LONG')}, SHORT {sum(tr.side=='SHORT')})")
+    print(f"Winners / Losers          : {len(wins)} / {len(losses)}")
+    print(f"Win rate                  : {len(wins)/len(tr)*100:.1f}%")
+    print(f"Net P&L                   : Rs {tr.net_pnl.sum():.2f}")
+    print(f"Total fees paid           : Rs {tr.fees.sum():.2f}")
+    print(f"Avg win / Avg loss        : Rs {wins.net_pnl.mean() if len(wins) else 0:.2f}"
+          f" / Rs {losses.net_pnl.mean() if len(losses) else 0:.2f}")
+    print(f"Profit factor             : {gp/gl:.2f}" if gl else "Profit factor             : inf")
+    print(f"Max drawdown              : Rs {dd:.2f}")
+    print(f"Return on Rs {CAPITAL_PER_TRADE:.0f}        : {tr.net_pnl.sum()/CAPITAL_PER_TRADE*100:.2f}%")
+    print("-" * 60)
+    print(tr.to_string(index=False))
+    tag = args.tf.replace("/", "")
+    tr.to_csv(f"backtest_trades_{tag}.csv", index=False)
+    print(f"\nTrade log saved: backtest_trades_{tag}.csv")
+    write_gh_summary(tr, n_pivots, args, dd, gp, gl)
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(9, 4))
+        plt.plot(range(1, len(eq) + 1), eq.values, marker="o")
+        plt.axhline(0, color="gray", lw=0.8)
+        plt.title("Equity curve (Rs, net of fees)")
+        plt.xlabel("Trade #"); plt.ylabel("Cumulative P&L")
+        plt.tight_layout(); plt.savefig(f"equity_curve_{tag}.png", dpi=120)
+        print(f"Equity curve saved: equity_curve_{tag}.png")
+    except ImportError:
+        pass
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--symbol", default="BTC/USDT")
+    ap.add_argument("--tf", default="15m")
+    ap.add_argument("--length", type=int, default=50)
+    ap.add_argument("--days", type=int, default=30)
+    ap.add_argument("--csv", default=None)
+    ap.add_argument("--exchange", default="binance",
+                    help="binance (local) / binanceus (GitHub Actions)")
+    args = ap.parse_args()
+
+    if args.csv:
+        data = load_csv(args.csv)
+    else:
+        data = fetch_ohlcv(args.symbol, args.tf, args.days, 2 * args.length + 5, args.exchange)
+    trades, npv = backtest(data, args.length, args.days)
+    report(trades, npv, args)
