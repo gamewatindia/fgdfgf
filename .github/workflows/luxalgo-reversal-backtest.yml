@@ -1,4 +1,4 @@
-name: LuxAlgo Pivot Reversal Backtest
+name: LuxAlgo First Dynamic Reversal Backtest
 
 on:
   workflow_dispatch:
@@ -23,7 +23,6 @@ on:
           - LAST_PRICE
           - MARK_PRICE
 
-
 jobs:
 
   backtest:
@@ -35,18 +34,15 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install pandas requests
-
 
       - name: Run LuxAlgo backtest
         run: |
@@ -55,9 +51,8 @@ jobs:
             --days "${{ github.event.inputs.days }}" \
             --price-type "${{ github.event.inputs.price_type }}"
 
-
       - name: Upload backtest results
         uses: actions/upload-artifact@v4
         with:
-          name: luxalgo-${{ github.event.inputs.pair }}-results
+          name: luxalgo-${{ github.event.inputs.pair }}-dynamic-reversal
           path: results/
