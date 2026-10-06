@@ -1,11 +1,8 @@
-#!/usr/bin/env python3
-
 import argparse
-import math
 import time
-from dataclasses import dataclass, asdict
-from datetime import datetime, timedelta, timezone
+import math
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import requests
@@ -15,361 +12,315 @@ import requests
 # CONFIG
 # =========================================================
 
-SHARK_URL = "https://api.sharkexchange.in/v1/market/klines"
+API_URL = "https://api.sharkexchange.in/v1/market/klines"
 
 PIVOT_LENGTH = 50
 
-MARGIN_INR = 1000.0
+MARGIN = 1000.0
 LEVERAGE = 10.0
 
-TOUCH_TOLERANCE_PCT = 0.0015
+TOUCH_TOLERANCE = 0.0015
 
-TAKER_FEE = 0.00040
-GST_ON_FEE = 0.18
+FEE_RATE = 0.00040
+GST = 0.18
 SLIPPAGE = 0.00020
 
-MAX_LIMIT = 1000
-MAX_BARS_IN_TRADE = 2000
-
-
-INTERVAL_MS = {
-    "1m": 60_000,
-    "3m": 180_000,
-    "5m": 300_000,
-    "15m": 900_000,
-    "30m": 1_800_000,
-    "1h": 3_600_000,
-    "2h": 7_200_000,
-    "4h": 14_400_000,
-    "6h": 21_600_000,
-    "8h": 28_800_000,
-    "12h": 43_200_000,
-    "1d": 86_400_000,
-    "3d": 259_200_000,
-    "1w": 604_800_000,
-}
+LIMIT = 1000
 
 
 # =========================================================
-# DATA STRUCTURES
+# DOWNLOAD SHARK KLINES
 # =========================================================
 
-@dataclass
-class Level:
-    price: float
-    kind: str
-    source: str
-    bar: int
-    active: bool = True
+def download_klines(pair, days, price_type):
 
+    end_time = datetime.now(timezone.utc)
 
-@dataclass
-class Trade:
-    symbol: str
-    side: str
-
-    signal_bar: int
-    entry_bar: int
-    exit_bar: int
-
-    signal_time: str
-    entry_time: str
-    exit_time: str
-
-    entry: float
-    stop: float
-    target: float
-    exit: float
-
-    qty: float
-    margin: float
-    leverage: float
-
-    pnl_gross: float
-    fees: float
-    pnl_net: float
-
-    rr_planned: float
-
-    exit_reason: str
-
-    level_source: str
-    level_price: float
-
-
-# =========================================================
-# SHARK API
-# =========================================================
-
-def extract_rows(payload):
-
-    if isinstance(payload, list):
-        return payload
-
-    if isinstance(payload, dict):
-
-        for key in (
-            "data",
-            "result",
-            "klines",
-            "rows"
-        ):
-
-            value = payload.get(key)
-
-            if isinstance(value, list):
-                return value
-
-    raise RuntimeError(
-        f"Unexpected Shark API response: "
-        f"{type(payload).__name__}"
-    )
-
-
-def normalize_rows(rows):
-
-    output = []
-
-    for row in rows:
-
-        if not isinstance(row, dict):
-            continue
-
-        if "startTime" not in row:
-            continue
-
-        try:
-
-            start_time = int(row["startTime"])
-
-            output.append({
-                "timestamp": pd.to_datetime(
-                    start_time,
-                    unit="ms",
-                    utc=True
-                ),
-
-                "open": float(row["open"]),
-                "high": float(row["high"]),
-                "low": float(row["low"]),
-                "close": float(row["close"]),
-
-                "volume": float(
-                    row.get("volume", 0)
-                ),
-
-                "endTime": int(
-                    row.get(
-                        "endTime",
-                        start_time
-                    )
-                )
-            })
-
-        except Exception:
-            continue
-
-    return output
-
-
-def download_shark_data(
-    pair,
-    interval,
-    days,
-    price_type
-):
-
-    if interval not in INTERVAL_MS:
-
-        raise ValueError(
-            f"Unsupported interval: {interval}"
-        )
-
-    interval_ms = INTERVAL_MS[interval]
-
-    now = datetime.now(timezone.utc)
-
-    start = (
-        now -
+    start_time = (
+        end_time -
         timedelta(days=days)
     )
 
     start_ms = int(
-        start.timestamp() * 1000
+        start_time.timestamp() * 1000
     )
 
     end_ms = int(
-        now.timestamp() * 1000
+        end_time.timestamp() * 1000
     )
 
+    interval_ms = 5 * 60 * 1000
+
+    all_data = []
+
     cursor = start_ms
-
-    all_rows = []
-
-    page = 0
 
     session = requests.Session()
 
     session.headers.update({
-        "Content-Type": "application/json",
-        "User-Agent": "LuxAlgo-Backtest/1.0"
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json",
+        "Content-Type": "application/json"
     })
 
-    print()
     print("=" * 60)
-    print("DOWNLOADING SHARK EXCHANGE DATA")
+    print("SHARK EXCHANGE DATA")
     print("=" * 60)
 
     print(f"Pair       : {pair}")
-    print(f"Interval   : {interval}")
+    print("Interval   : 5m")
     print(f"Days       : {days}")
     print(f"Price type : {price_type}")
     print()
+
+    page = 0
 
     while cursor < end_ms:
 
         page += 1
 
-        body = {
+        params = {
             "pair": pair.upper(),
-            "interval": interval,
-            "startTime": cursor,
-            "endTime": end_ms,
-            "limit": MAX_LIMIT
+            "interval": "5m",
+            "priceType": price_type,
+            "limit": LIMIT
         }
+
+        # Shark SDK documents pair/interval/priceType/limit
+        # for public market klines.
 
         try:
 
-            response = session.post(
-                f"{SHARK_URL}?priceType={price_type}",
-                json=body,
+            response = session.get(
+                API_URL,
+                params=params,
                 timeout=30
             )
 
             response.raise_for_status()
 
-            payload = response.json()
-
-            rows = extract_rows(payload)
+            result = response.json()
 
         except Exception as e:
 
             print(
-                f"Page {page} ERROR: {e}"
+                f"Page {page} error: {e}"
             )
 
-            time.sleep(2)
+            time.sleep(3)
 
             page -= 1
 
             continue
 
-        if not rows:
+        if isinstance(result, dict):
+
+            data = result.get(
+                "data",
+                []
+            )
+
+        else:
+
+            data = result
+
+        if not data:
 
             print(
-                f"Page {page}: no more candles."
+                "No more candles returned."
             )
 
             break
 
-        normalized = normalize_rows(rows)
+        # -------------------------------------------------
+        # Parse candles
+        # -------------------------------------------------
 
-        if not normalized:
+        parsed = []
 
-            raise RuntimeError(
-                "Shark returned candle data "
-                "but it could not be parsed."
+        for row in data:
+
+            try:
+
+                if isinstance(row, list):
+
+                    if len(row) < 6:
+                        continue
+
+                    ts = int(row[0])
+
+                    o = float(row[1])
+                    h = float(row[2])
+                    l = float(row[3])
+                    c = float(row[4])
+
+                    v = float(row[5])
+
+                    end_ts = (
+                        int(row[6])
+                        if len(row) > 6
+                        else ts + interval_ms - 1
+                    )
+
+                elif isinstance(row, dict):
+
+                    ts = int(
+                        row.get(
+                            "startTime",
+                            row.get(
+                                "timestamp"
+                            )
+                        )
+                    )
+
+                    o = float(
+                        row["open"]
+                    )
+
+                    h = float(
+                        row["high"]
+                    )
+
+                    l = float(
+                        row["low"]
+                    )
+
+                    c = float(
+                        row["close"]
+                    )
+
+                    v = float(
+                        row.get(
+                            "volume",
+                            0
+                        )
+                    )
+
+                    end_ts = int(
+                        row.get(
+                            "endTime",
+                            ts +
+                            interval_ms -
+                            1
+                        )
+                    )
+
+                else:
+
+                    continue
+
+                parsed.append({
+
+                    "timestamp": pd.to_datetime(
+                        ts,
+                        unit="ms",
+                        utc=True
+                    ),
+
+                    "open": o,
+                    "high": h,
+                    "low": l,
+                    "close": c,
+                    "volume": v,
+
+                    "endTime": end_ts,
+
+                    "_ts": ts
+                })
+
+            except Exception:
+
+                continue
+
+        if not parsed:
+
+            print(
+                "Unable to parse API response."
             )
 
-        all_rows.extend(normalized)
+            break
 
-        latest_timestamp = max(
-            row["timestamp"]
-            for row in normalized
+        all_data.extend(
+            parsed
+        )
+
+        newest = max(
+            x["_ts"]
+            for x in parsed
+        )
+
+        oldest = min(
+            x["_ts"]
+            for x in parsed
         )
 
         print(
             f"Page {page}: "
-            f"{len(normalized)} candles | "
-            f"through "
-            f"{latest_timestamp.isoformat()}"
+            f"{len(parsed)} candles | "
+            f"{pd.to_datetime(newest, unit='ms', utc=True)}"
         )
 
-        latest_ms = int(
-            latest_timestamp.timestamp() * 1000
-        )
+        # -------------------------------------------------
+        # Pagination
+        # -------------------------------------------------
 
         next_cursor = (
-            latest_ms +
+            newest +
             interval_ms
         )
 
         if next_cursor <= cursor:
 
-            raise RuntimeError(
-                "Pagination did not advance."
+            print(
+                "Pagination stopped."
             )
+
+            break
 
         cursor = next_cursor
 
-        time.sleep(0.15)
+        # If API gives only a small page but has not
+        # reached requested end, continue anyway.
+        if newest >= end_ms:
 
-        # IMPORTANT:
-        # Do NOT stop just because this page has fewer
-        # than 1000 candles.
-        #
-        # This prevents the previous 999-candle bug.
-
-        if latest_ms >= end_ms:
             break
 
-    if not all_rows:
+        time.sleep(0.20)
+
+    if not all_data:
 
         raise RuntimeError(
-            f"No candles received for {pair}."
+            "No Shark candle data received."
         )
 
     df = pd.DataFrame(
-        all_rows
+        all_data
     )
 
-    df = (
-        df
-        .sort_values("timestamp")
-        .drop_duplicates(
-            subset=["timestamp"],
-            keep="last"
-        )
-        .reset_index(drop=True)
+    df.drop_duplicates(
+        subset=["_ts"],
+        keep="last",
+        inplace=True
     )
 
-    # -----------------------------------------------------
-    # Remove future/open candle
-    # -----------------------------------------------------
+    df.sort_values(
+        "_ts",
+        inplace=True
+    )
 
+    # Requested period
+    df = df[
+        (df["_ts"] >= start_ms) &
+        (df["_ts"] <= end_ms)
+    ].copy()
+
+    # Remove current candle
     current_ms = int(
         time.time() * 1000
     )
 
     df = df[
         df["endTime"] < current_ms
-    ].copy()
-
-    # -----------------------------------------------------
-    # Keep requested period
-    # -----------------------------------------------------
-
-    start_timestamp = pd.Timestamp(
-        start
-    )
-
-    end_timestamp = pd.Timestamp(
-        now
-    )
-
-    df = df[
-        (df["timestamp"] >= start_timestamp) &
-        (df["timestamp"] <= end_timestamp)
     ].copy()
 
     df.reset_index(
@@ -380,9 +331,7 @@ def download_shark_data(
     if len(df) < 200:
 
         raise RuntimeError(
-            f"Only {len(df)} closed candles "
-            f"were downloaded.\n"
-            f"Need at least 200 candles."
+            f"Only {len(df)} closed candles found."
         )
 
     print()
@@ -415,608 +364,363 @@ def download_shark_data(
 
 
 # =========================================================
-# INDICATOR / PIVOT FUNCTIONS
+# PIVOT
 # =========================================================
 
-def is_pivot_high(
-    df,
-    pivot_i,
-    length
-):
+def is_pivot_high(df, i):
 
-    price = float(
-        df.at[pivot_i, "high"]
+    if (
+        i < PIVOT_LENGTH
+        or
+        i + PIVOT_LENGTH >= len(df)
+    ):
+        return False
+
+    value = float(
+        df.iloc[i]["high"]
     )
 
-    left = df[
-        "high"
-    ].iloc[
-        pivot_i - length:pivot_i
-    ]
+    left = df.iloc[
+        i - PIVOT_LENGTH:i
+    ]["high"]
 
-    right = df[
-        "high"
-    ].iloc[
-        pivot_i + 1:
-        pivot_i + length + 1
-    ]
+    right = df.iloc[
+        i + 1:
+        i + PIVOT_LENGTH + 1
+    ]["high"]
 
     return (
-        price >= float(left.max())
+        value >= left.max()
         and
-        price >= float(right.max())
+        value >= right.max()
     )
 
 
-def is_pivot_low(
-    df,
-    pivot_i,
-    length
-):
+def is_pivot_low(df, i):
 
-    price = float(
-        df.at[pivot_i, "low"]
+    if (
+        i < PIVOT_LENGTH
+        or
+        i + PIVOT_LENGTH >= len(df)
+    ):
+        return False
+
+    value = float(
+        df.iloc[i]["low"]
     )
 
-    left = df[
-        "low"
-    ].iloc[
-        pivot_i - length:pivot_i
-    ]
+    left = df.iloc[
+        i - PIVOT_LENGTH:i
+    ]["low"]
 
-    right = df[
-        "low"
-    ].iloc[
-        pivot_i + 1:
-        pivot_i + length + 1
-    ]
+    right = df.iloc[
+        i + 1:
+        i + PIVOT_LENGTH + 1
+    ]["low"]
 
     return (
-        price <= float(left.min())
+        value <= left.min()
         and
-        price <= float(right.min())
+        value <= right.min()
     )
 
 
 # =========================================================
-# FEES / SLIPPAGE
+# FEE
 # =========================================================
 
-def fee_for_notional(
-    notional
-):
+def calculate_fee(notional):
 
-    trading_fee = (
+    return (
         notional *
-        TAKER_FEE
+        FEE_RATE *
+        (1 + GST)
     )
-
-    return (
-        trading_fee *
-        (1 + GST_ON_FEE)
-    )
-
-
-def apply_entry_slippage(
-    price,
-    side
-):
-
-    if side == "LONG":
-
-        return price * (
-            1 + SLIPPAGE
-        )
-
-    return price * (
-        1 - SLIPPAGE
-    )
-
-
-def apply_exit_slippage(
-    price,
-    side
-):
-
-    if side == "LONG":
-
-        return price * (
-            1 - SLIPPAGE
-        )
-
-    return price * (
-        1 + SLIPPAGE
-    )
-
-
-# =========================================================
-# LUXALGO REVERSAL TARGET
-# =========================================================
-
-def find_reversal_target(
-    side,
-    entry,
-    levels
-):
-
-    # LONG:
-    # nearest resistance above entry
-
-    if side == "LONG":
-
-        candidates = [
-            level
-
-            for level in levels
-
-            if (
-                level.active
-                and
-                level.kind == "resistance"
-                and
-                level.price > entry
-            )
-        ]
-
-        if not candidates:
-            return None
-
-        return min(
-            candidates,
-            key=lambda x: x.price
-        )
-
-    # SHORT:
-    # nearest support below entry
-
-    if side == "SHORT":
-
-        candidates = [
-            level
-
-            for level in levels
-
-            if (
-                level.active
-                and
-                level.kind == "support"
-                and
-                level.price < entry
-            )
-        ]
-
-        if not candidates:
-            return None
-
-        return max(
-            candidates,
-            key=lambda x: x.price
-        )
-
-    return None
 
 
 # =========================================================
 # BACKTEST
 # =========================================================
 
-def run_backtest(
-    df,
-    symbol
-):
+def run_backtest(df, symbol):
 
-    levels = []
+    resistance = []
+    support = []
+
+    pending = None
+    position = None
 
     trades = []
 
-    pending = None
+    last_pivot = None
 
-    open_trade = None
-
-    running_high = -math.inf
-    running_low = math.inf
-
-    running_high_bar = None
-    running_low_bar = None
-
-    last_pivot_type = None
-
-    start = (
-        PIVOT_LENGTH * 2
-    )
-
-    n = len(df)
+    running_high = None
+    running_low = None
 
     for i in range(
-        start,
-        n
+        PIVOT_LENGTH * 2,
+        len(df)
     ):
 
-        row = df.iloc[i]
+        candle = df.iloc[i]
+
+        o = float(candle["open"])
+        h = float(candle["high"])
+        l = float(candle["low"])
+        c = float(candle["close"])
 
         # =================================================
-        # CONFIRM OLD PIVOT
+        # CONFIRMED PIVOT
         # =================================================
 
-        pivot_i = (
-            i -
-            PIVOT_LENGTH
-        )
+        p = i - PIVOT_LENGTH
 
-        # -------------------------------------------------
-        # PIVOT HIGH
-        # -------------------------------------------------
+        if is_pivot_high(df, p):
 
-        if is_pivot_high(
-            df,
-            pivot_i,
-            PIVOT_LENGTH
-        ):
-
-            pivot_price = float(
-                df.at[
-                    pivot_i,
-                    "high"
-                ]
+            pivot_high = float(
+                df.iloc[p]["high"]
             )
 
-            # Missed support
+            # Missed reversal support
             if (
-                last_pivot_type == "high"
+                last_pivot == "HIGH"
                 and
-                running_low < math.inf
+                running_low is not None
             ):
 
-                levels.append(
-                    Level(
-                        price=running_low,
-                        kind="support",
-                        source="missed",
-                        bar=int(
-                            running_low_bar
-                        )
-                    )
+                support.append(
+                    running_low
                 )
 
-            # Regular resistance
-            levels.append(
-                Level(
-                    price=pivot_price,
-                    kind="resistance",
-                    source="regular",
-                    bar=pivot_i
-                )
+            resistance.append(
+                pivot_high
             )
 
-            last_pivot_type = "high"
+            last_pivot = "HIGH"
 
-            running_high = pivot_price
-            running_high_bar = pivot_i
-
+            running_high = pivot_high
             running_low = float(
-                df.at[
-                    pivot_i,
-                    "low"
-                ]
+                df.iloc[p]["low"]
             )
 
-            running_low_bar = pivot_i
+        if is_pivot_low(df, p):
 
-        # -------------------------------------------------
-        # PIVOT LOW
-        # -------------------------------------------------
-
-        if is_pivot_low(
-            df,
-            pivot_i,
-            PIVOT_LENGTH
-        ):
-
-            pivot_price = float(
-                df.at[
-                    pivot_i,
-                    "low"
-                ]
+            pivot_low = float(
+                df.iloc[p]["low"]
             )
 
-            # Missed resistance
+            # Missed reversal resistance
             if (
-                last_pivot_type == "low"
+                last_pivot == "LOW"
                 and
-                running_high > -math.inf
+                running_high is not None
             ):
 
-                levels.append(
-                    Level(
-                        price=running_high,
-                        kind="resistance",
-                        source="missed",
-                        bar=int(
-                            running_high_bar
-                        )
-                    )
+                resistance.append(
+                    running_high
                 )
 
-            # Regular support
-            levels.append(
-                Level(
-                    price=pivot_price,
-                    kind="support",
-                    source="regular",
-                    bar=pivot_i
-                )
+            support.append(
+                pivot_low
             )
 
-            last_pivot_type = "low"
+            last_pivot = "LOW"
 
-            running_low = pivot_price
-            running_low_bar = pivot_i
-
+            running_low = pivot_low
             running_high = float(
-                df.at[
-                    pivot_i,
-                    "high"
-                ]
+                df.iloc[p]["high"]
             )
 
-            running_high_bar = pivot_i
+        # Update extremes
+        if (
+            running_high is None
+            or
+            h > running_high
+        ):
+            running_high = h
+
+        if (
+            running_low is None
+            or
+            l < running_low
+        ):
+            running_low = l
 
         # =================================================
-        # UPDATE EXTREMES
+        # MANAGE OPEN POSITION
         # =================================================
 
-        high = float(
-            row["high"]
-        )
+        if position is not None:
 
-        low = float(
-            row["low"]
-        )
+            side = position["side"]
 
-        if high > running_high:
+            if side == "LONG":
 
-            running_high = high
-            running_high_bar = i
-
-        if low < running_low:
-
-            running_low = low
-            running_low_bar = i
-
-        # =================================================
-        # MANAGE OPEN TRADE
-        # =================================================
-
-        if open_trade is not None:
-
-            trade = open_trade
-
-            bars_held = (
-                i -
-                trade["entry_bar"]
-            )
-
-            hi = float(
-                row["high"]
-            )
-
-            lo = float(
-                row["low"]
-            )
-
-            if trade["side"] == "LONG":
-
-                hit_sl = (
-                    lo <= trade["stop"]
+                sl_hit = (
+                    l <= position["stop"]
                 )
 
-                hit_target = (
-                    hi >= trade["target"]
+                target_hit = (
+                    h >= position["target"]
                 )
 
             else:
 
-                hit_sl = (
-                    hi >= trade["stop"]
+                sl_hit = (
+                    h >= position["stop"]
                 )
 
-                hit_target = (
-                    lo <= trade["target"]
+                target_hit = (
+                    l <= position["target"]
                 )
 
             exit_reason = None
-            raw_exit = None
+            exit_raw = None
 
-            # SL gets priority if both happen
-            # in the same candle.
-
-            if hit_sl:
+            if sl_hit:
 
                 exit_reason = "SL"
-                raw_exit = trade["stop"]
+                exit_raw = position["stop"]
 
-            elif hit_target:
+            elif target_hit:
 
                 exit_reason = "TARGET"
-                raw_exit = trade["target"]
-
-            elif (
-                bars_held >=
-                MAX_BARS_IN_TRADE
-            ):
-
-                exit_reason = "TIME"
-                raw_exit = float(
-                    row["close"]
-                )
+                exit_raw = position["target"]
 
             if exit_reason:
 
-                exit_price = apply_exit_slippage(
-                    raw_exit,
-                    trade["side"]
-                )
+                if side == "LONG":
 
-                if trade["side"] == "LONG":
+                    exit_actual = (
+                        exit_raw *
+                        (1 - SLIPPAGE)
+                    )
 
                     gross = (
-                        exit_price -
-                        trade["entry"]
-                    ) * trade["qty"]
+                        exit_actual -
+                        position["entry"]
+                    ) * position["qty"]
 
                 else:
 
+                    exit_actual = (
+                        exit_raw *
+                        (1 + SLIPPAGE)
+                    )
+
                     gross = (
-                        trade["entry"] -
-                        exit_price
-                    ) * trade["qty"]
+                        position["entry"] -
+                        exit_actual
+                    ) * position["qty"]
 
-                exit_notional = (
-                    exit_price *
-                    trade["qty"]
+                exit_fee = calculate_fee(
+                    exit_actual *
+                    position["qty"]
                 )
 
-                exit_fee = fee_for_notional(
-                    exit_notional
-                )
-
-                total_fees = (
-                    trade["entry_fee"] +
+                total_fee = (
+                    position["entry_fee"]
+                    +
                     exit_fee
                 )
 
                 net = (
                     gross -
-                    total_fees
+                    total_fee
                 )
 
-                trades.append(
-                    Trade(
-                        symbol=symbol,
+                trades.append({
 
-                        side=trade["side"],
+                    "symbol": symbol,
 
-                        signal_bar=trade[
-                            "signal_bar"
-                        ],
+                    "side": side,
 
-                        entry_bar=trade[
-                            "entry_bar"
-                        ],
+                    "signal_time":
+                        position["signal_time"],
 
-                        exit_bar=i,
+                    "entry_time":
+                        position["entry_time"],
 
-                        signal_time=df.at[
-                            trade["signal_bar"],
+                    "exit_time":
+                        candle[
                             "timestamp"
                         ].isoformat(),
 
-                        entry_time=df.at[
-                            trade["entry_bar"],
-                            "timestamp"
-                        ].isoformat(),
+                    "entry":
+                        position["entry"],
 
-                        exit_time=df.at[
-                            i,
-                            "timestamp"
-                        ].isoformat(),
+                    "stop":
+                        position["stop"],
 
-                        entry=trade["entry"],
+                    "target":
+                        position["target"],
 
-                        stop=trade["stop"],
+                    "exit":
+                        exit_actual,
 
-                        target=trade["target"],
+                    "qty":
+                        position["qty"],
 
-                        exit=exit_price,
+                    "margin":
+                        MARGIN,
 
-                        qty=trade["qty"],
+                    "leverage":
+                        LEVERAGE,
 
-                        margin=MARGIN_INR,
+                    "planned_rr":
+                        position["planned_rr"],
 
-                        leverage=LEVERAGE,
+                    "gross_pnl":
+                        gross,
 
-                        pnl_gross=gross,
+                    "fees":
+                        total_fee,
 
-                        fees=total_fees,
+                    "net_pnl":
+                        net,
 
-                        pnl_net=net,
+                    "exit_reason":
+                        exit_reason,
 
-                        rr_planned=trade[
-                            "rr_planned"
-                        ],
-
-                        exit_reason=exit_reason,
-
-                        level_source=trade[
-                            "level_source"
-                        ],
-
-                        level_price=trade[
-                            "level_price"
+                    "target_source":
+                        position[
+                            "target_source"
                         ]
-                    )
-                )
+                })
 
-                open_trade = None
-                pending = None
+                position = None
 
                 continue
 
         # =================================================
-        # WAIT FOR ENTRY BREAKOUT
+        # PENDING ENTRY
         # =================================================
 
         if (
-            open_trade is None
-            and
             pending is not None
+            and
+            position is None
+            and
+            i > pending["signal_bar"]
         ):
 
-            if (
-                i >
-                pending["signal_bar"]
-            ):
+            side = pending["side"]
 
-                high = float(
-                    row["high"]
-                )
+            if side == "LONG":
 
-                low = float(
-                    row["low"]
-                )
+                if h > pending["trigger"]:
 
-                # -------------------------------------------------
-                # LONG BREAKOUT
-                # -------------------------------------------------
-
-                if (
-                    pending["side"]
-                    == "LONG"
-                    and
-                    high >
-                    pending["trigger"]
-                ):
-
-                    entry_raw = (
-                        pending["trigger"]
+                    entry = (
+                        pending["trigger"] *
+                        (1 + SLIPPAGE)
                     )
 
-                    entry = apply_entry_slippage(
-                        entry_raw,
-                        "LONG"
-                    )
-
-                    stop = (
-                        pending["stop"]
-                    )
+                    stop = pending["stop"]
+                    target = pending["target"]
 
                     risk = (
                         entry -
                         stop
-                    )
-
-                    target = (
-                        pending["target"]
                     )
 
                     if (
@@ -1030,85 +734,64 @@ def run_backtest(
                             entry
                         ) / risk
 
-                        if rr >= 0.5:
+                        qty = (
+                            MARGIN *
+                            LEVERAGE /
+                            entry
+                        )
 
-                            qty = (
-                                MARGIN_INR *
-                                LEVERAGE
-                            ) / entry
+                        position = {
 
-                            entry_fee = fee_for_notional(
-                                entry * qty
-                            )
+                            "side": "LONG",
 
-                            open_trade = {
+                            "entry": entry,
 
-                                "side": "LONG",
+                            "stop": stop,
 
-                                "entry": entry,
+                            "target": target,
 
-                                "stop": stop,
+                            "qty": qty,
 
-                                "target": target,
+                            "entry_fee":
+                                calculate_fee(
+                                    entry * qty
+                                ),
 
-                                "qty": qty,
+                            "signal_time":
+                                pending[
+                                    "signal_time"
+                                ],
 
-                                "entry_fee": entry_fee,
+                            "entry_time":
+                                candle[
+                                    "timestamp"
+                                ].isoformat(),
 
-                                "entry_bar": i,
+                            "planned_rr": rr,
 
-                                "signal_bar":
-                                    pending[
-                                        "signal_bar"
-                                    ],
+                            "target_source":
+                                pending[
+                                    "target_source"
+                                ]
+                        }
 
-                                "rr_planned": rr,
+                    pending = None
 
-                                "level_source":
-                                    pending[
-                                        "level_source"
-                                    ],
+            else:
 
-                                "level_price":
-                                    pending[
-                                        "level_price"
-                                    ]
-                            }
+                if l < pending["trigger"]:
 
-                            pending = None
-
-                # -------------------------------------------------
-                # SHORT BREAKOUT
-                # -------------------------------------------------
-
-                elif (
-                    pending["side"]
-                    == "SHORT"
-                    and
-                    low <
-                    pending["trigger"]
-                ):
-
-                    entry_raw = (
-                        pending["trigger"]
+                    entry = (
+                        pending["trigger"] *
+                        (1 - SLIPPAGE)
                     )
 
-                    entry = apply_entry_slippage(
-                        entry_raw,
-                        "SHORT"
-                    )
-
-                    stop = (
-                        pending["stop"]
-                    )
+                    stop = pending["stop"]
+                    target = pending["target"]
 
                     risk = (
                         stop -
                         entry
-                    )
-
-                    target = (
-                        pending["target"]
                     )
 
                     if (
@@ -1122,181 +805,87 @@ def run_backtest(
                             target
                         ) / risk
 
-                        if rr >= 0.5:
+                        qty = (
+                            MARGIN *
+                            LEVERAGE /
+                            entry
+                        )
 
-                            qty = (
-                                MARGIN_INR *
-                                LEVERAGE
-                            ) / entry
+                        position = {
 
-                            entry_fee = fee_for_notional(
-                                entry * qty
-                            )
+                            "side": "SHORT",
 
-                            open_trade = {
+                            "entry": entry,
 
-                                "side": "SHORT",
+                            "stop": stop,
 
-                                "entry": entry,
+                            "target": target,
 
-                                "stop": stop,
+                            "qty": qty,
 
-                                "target": target,
+                            "entry_fee":
+                                calculate_fee(
+                                    entry * qty
+                                ),
 
-                                "qty": qty,
+                            "signal_time":
+                                pending[
+                                    "signal_time"
+                                ],
 
-                                "entry_fee": entry_fee,
+                            "entry_time":
+                                candle[
+                                    "timestamp"
+                                ].isoformat(),
 
-                                "entry_bar": i,
+                            "planned_rr": rr,
 
-                                "signal_bar":
-                                    pending[
-                                        "signal_bar"
-                                    ],
+                            "target_source":
+                                pending[
+                                    "target_source"
+                                ]
+                        }
 
-                                "rr_planned": rr,
-
-                                "level_source":
-                                    pending[
-                                        "level_source"
-                                    ],
-
-                                "level_price":
-                                    pending[
-                                        "level_price"
-                                    ]
-                            }
-
-                            pending = None
+                    pending = None
 
         # =================================================
-        # CREATE NEW SIGNAL
+        # NEW SIGNAL
         # =================================================
 
         if (
-            open_trade is None
-            and
             pending is None
+            and
+            position is None
         ):
 
-            open_price = float(
-                row["open"]
-            )
+            # LONG: support touch + bullish candle
 
-            close_price = float(
-                row["close"]
-            )
-
-            high = float(
-                row["high"]
-            )
-
-            low = float(
-                row["low"]
-            )
-
-            bullish = (
-                close_price >
-                open_price
-            )
-
-            bearish = (
-                close_price <
-                open_price
-            )
-
-            # -------------------------------------------------
-            # SUPPORT TEST
-            # -------------------------------------------------
-
-            support_candidates = [
-
-                level
-
-                for level in levels
-
+            supports = [
+                x for x in support
                 if (
-                    level.active
+                    abs(l - x) / x
+                    <= TOUCH_TOLERANCE
                     and
-                    level.kind ==
-                    "support"
-                    and
-                    abs(
-                        low -
-                        level.price
-                    ) /
-                    level.price
-                    <=
-                    TOUCH_TOLERANCE_PCT
-                    and
-                    close_price >
-                    level.price
+                    c > x
                 )
             ]
-
-            # -------------------------------------------------
-            # RESISTANCE TEST
-            # -------------------------------------------------
-
-            resistance_candidates = [
-
-                level
-
-                for level in levels
-
-                if (
-                    level.active
-                    and
-                    level.kind ==
-                    "resistance"
-                    and
-                    abs(
-                        high -
-                        level.price
-                    ) /
-                    level.price
-                    <=
-                    TOUCH_TOLERANCE_PCT
-                    and
-                    close_price <
-                    level.price
-                )
-            ]
-
-            # -------------------------------------------------
-            # LONG
-            # -------------------------------------------------
 
             if (
-                bullish
+                c > o
                 and
-                support_candidates
+                supports
             ):
 
-                level = max(
-                    support_candidates,
-                    key=lambda x:
-                    x.price
-                )
+                target_levels = [
+                    x for x in resistance
+                    if x > c
+                ]
 
-                stop = low
+                if target_levels:
 
-                target_level = (
-                    find_reversal_target(
-                        "LONG",
-                        close_price,
-                        levels
+                    target = min(
+                        target_levels
                     )
-                )
-
-                if (
-                    stop < close_price
-                    and
-                    target_level is not None
-                    and
-                    target_level.price >
-                    close_price
-                ):
 
                     pending = {
 
@@ -1304,231 +893,74 @@ def run_backtest(
 
                         "signal_bar": i,
 
-                        "trigger": high,
+                        "signal_time":
+                            candle[
+                                "timestamp"
+                            ].isoformat(),
 
-                        "stop": stop,
+                        "trigger": h,
 
-                        "target":
-                            target_level.price,
+                        "stop": l,
 
-                        "level_source":
-                            level.source,
+                        "target": target,
 
-                        "level_price":
-                            level.price
+                        "target_source":
+                            "nearest_reversal_resistance"
                     }
 
-            # -------------------------------------------------
-            # SHORT
-            # -------------------------------------------------
+            # SHORT: resistance touch + bearish
 
-            elif (
-                bearish
-                and
-                resistance_candidates
-            ):
+            else:
 
-                level = min(
-                    resistance_candidates,
-                    key=lambda x:
-                    x.price
-                )
-
-                stop = high
-
-                target_level = (
-                    find_reversal_target(
-                        "SHORT",
-                        close_price,
-                        levels
+                resistances = [
+                    x for x in resistance
+                    if (
+                        abs(h - x) / x
+                        <= TOUCH_TOLERANCE
+                        and
+                        c < x
                     )
-                )
+                ]
 
                 if (
-                    stop > close_price
+                    c < o
                     and
-                    target_level is not None
-                    and
-                    target_level.price <
-                    close_price
+                    resistances
                 ):
 
-                    pending = {
+                    target_levels = [
+                        x for x in support
+                        if x < c
+                    ]
 
-                        "side": "SHORT",
+                    if target_levels:
 
-                        "signal_bar": i,
+                        target = max(
+                            target_levels
+                        )
 
-                        "trigger": low,
+                        pending = {
 
-                        "stop": stop,
+                            "side": "SHORT",
 
-                        "target":
-                            target_level.price,
+                            "signal_bar": i,
 
-                        "level_source":
-                            level.source,
+                            "signal_time":
+                                candle[
+                                    "timestamp"
+                                ].isoformat(),
 
-                        "level_price":
-                            level.price
-                    }
+                            "trigger": l,
 
-    return pd.DataFrame(
-        [
-            asdict(trade)
-            for trade in trades
-        ]
-    )
+                            "stop": h,
 
+                            "target": target,
 
-# =========================================================
-# SUMMARY
-# =========================================================
+                            "target_source":
+                                "nearest_reversal_support"
+                        }
 
-def make_summary(
-    trades,
-    label
-):
-
-    if trades.empty:
-
-        return {
-
-            "mode": label,
-
-            "trades": 0,
-
-            "wins": 0,
-
-            "losses": 0,
-
-            "win_rate_pct": 0,
-
-            "net_pnl_inr": 0,
-
-            "gross_pnl_inr": 0,
-
-            "fees_inr": 0,
-
-            "profit_factor": 0,
-
-            "max_drawdown_inr": 0
-        }
-
-    wins = trades[
-        trades["pnl_net"] > 0
-    ]
-
-    losses = trades[
-        trades["pnl_net"] <= 0
-    ]
-
-    gross_profit = float(
-        wins["pnl_net"].sum()
-    )
-
-    gross_loss = abs(
-        float(
-            losses["pnl_net"].sum()
-        )
-    )
-
-    if gross_loss > 0:
-
-        profit_factor = (
-            gross_profit /
-            gross_loss
-        )
-
-    else:
-
-        profit_factor = math.inf
-
-    equity = (
-        trades["pnl_net"]
-        .cumsum()
-    )
-
-    peak = (
-        equity
-        .cummax()
-    )
-
-    drawdown = (
-        equity -
-        peak
-    )
-
-    return {
-
-        "mode": label,
-
-        "trades": int(
-            len(trades)
-        ),
-
-        "wins": int(
-            len(wins)
-        ),
-
-        "losses": int(
-            len(losses)
-        ),
-
-        "win_rate_pct": round(
-            100 *
-            len(wins) /
-            len(trades),
-            2
-        ),
-
-        "net_pnl_inr": round(
-            float(
-                trades[
-                    "pnl_net"
-                ].sum()
-            ),
-            2
-        ),
-
-        "gross_pnl_inr": round(
-            float(
-                trades[
-                    "pnl_gross"
-                ].sum()
-            ),
-            2
-        ),
-
-        "fees_inr": round(
-            float(
-                trades[
-                    "fees"
-                ].sum()
-            ),
-            2
-        ),
-
-        "profit_factor":
-            round(
-                profit_factor,
-                3
-            )
-            if math.isfinite(
-                profit_factor
-            )
-            else "INF",
-
-        "max_drawdown_inr":
-            round(
-                abs(
-                    float(
-                        drawdown.min()
-                    )
-                ),
-                2
-            )
-    }
+    return pd.DataFrame(trades)
 
 
 # =========================================================
@@ -1545,11 +977,6 @@ def main():
     )
 
     parser.add_argument(
-        "--interval",
-        default="5m"
-    )
-
-    parser.add_argument(
         "--days",
         type=int,
         default=30
@@ -1557,102 +984,40 @@ def main():
 
     parser.add_argument(
         "--price-type",
-        choices=[
-            "LAST_PRICE",
-            "MARK_PRICE"
-        ],
         default="LAST_PRICE"
-    )
-
-    parser.add_argument(
-        "--out",
-        default="results"
     )
 
     args = parser.parse_args()
 
-    # =====================================================
-    # DOWNLOAD
-    # =====================================================
-
-    df = download_shark_data(
-        pair=args.pair,
-        interval=args.interval,
-        days=args.days,
-        price_type=args.price_type
+    df = download_klines(
+        args.pair,
+        args.days,
+        args.price_type
     )
-
-    # =====================================================
-    # BACKTEST
-    # =====================================================
 
     print()
     print("=" * 60)
-    print("STARTING LUXALGO BACKTEST")
+    print("RUNNING BACKTEST")
     print("=" * 60)
-
-    print(
-        f"Candles        : {len(df):,}"
-    )
-
-    print(
-        f"Period         : "
-        f"{df['timestamp'].iloc[0]} "
-        f"-> "
-        f"{df['timestamp'].iloc[-1]}"
-    )
-
-    print(
-        f"Pivot length   : "
-        f"{PIVOT_LENGTH}"
-    )
-
-    print(
-        f"Margin/trade   : "
-        f"INR {MARGIN_INR:,.0f}"
-    )
-
-    print(
-        f"Leverage       : "
-        f"{LEVERAGE:g}x"
-    )
-
-    print(
-        f"Position size  : "
-        f"INR "
-        f"{MARGIN_INR * LEVERAGE:,.0f}"
-    )
-
-    print(
-        f"Price type     : "
-        f"{args.price_type}"
-    )
 
     trades = run_backtest(
         df,
-        args.pair.upper()
+        args.pair
     )
 
-    # =====================================================
-    # SAVE RESULTS
-    # =====================================================
+    out = Path("results")
 
-    output_dir = Path(
-        args.out
-    )
-
-    output_dir.mkdir(
-        parents=True,
+    out.mkdir(
         exist_ok=True
     )
 
     trades_file = (
-        output_dir /
+        out /
         "trades_luxalgo_reversal.csv"
     )
 
     summary_file = (
-        output_dir /
+        out /
         "summary.csv"
     )
 
@@ -1661,48 +1026,113 @@ def main():
         index=False
     )
 
-    result = pd.DataFrame([
-        make_summary(
-            trades,
-            "LUXALGO_REVERSAL"
-        )
-    ])
+    if trades.empty:
 
-    result.to_csv(
+        summary = {
+            "trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "win_rate": 0,
+            "net_pnl": 0,
+            "fees": 0,
+            "profit_factor": 0
+        }
+
+    else:
+
+        wins = trades[
+            trades["net_pnl"] > 0
+        ]
+
+        losses = trades[
+            trades["net_pnl"] <= 0
+        ]
+
+        gross_profit = float(
+            wins["net_pnl"].sum()
+        )
+
+        gross_loss = abs(
+            float(
+                losses["net_pnl"].sum()
+            )
+        )
+
+        summary = {
+
+            "trades":
+                len(trades),
+
+            "wins":
+                len(wins),
+
+            "losses":
+                len(losses),
+
+            "win_rate":
+                round(
+                    len(wins) /
+                    len(trades) *
+                    100,
+                    2
+                ),
+
+            "net_pnl":
+                round(
+                    float(
+                        trades[
+                            "net_pnl"
+                        ].sum()
+                    ),
+                    2
+                ),
+
+            "fees":
+                round(
+                    float(
+                        trades[
+                            "fees"
+                        ].sum()
+                    ),
+                    2
+                ),
+
+            "profit_factor":
+                round(
+                    gross_profit /
+                    gross_loss,
+                    3
+                )
+                if gross_loss > 0
+                else "INF"
+        }
+
+    pd.DataFrame([
+        summary
+    ]).to_csv(
         summary_file,
         index=False
     )
 
-    # =====================================================
-    # PRINT
-    # =====================================================
-
     print()
     print("=" * 60)
-    print("BACKTEST SUMMARY")
+    print("BACKTEST COMPLETE")
     print("=" * 60)
 
-    print(
-        result.to_string(
-            index=False
+    for key, value in summary.items():
+
+        print(
+            f"{key:16}: {value}"
         )
-    )
 
     print()
     print(
-        f"Trades saved : "
-        f"{trades_file}"
+        f"Trades  : {trades_file}"
     )
 
     print(
-        f"Summary saved: "
-        f"{summary_file}"
+        f"Summary : {summary_file}"
     )
-
-    print()
-    print("=" * 60)
-    print("DONE")
-    print("=" * 60)
 
 
 if __name__ == "__main__":
