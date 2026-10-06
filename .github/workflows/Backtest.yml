@@ -13,7 +13,7 @@ on:
         required: true
         default: "30"
 
-      price_type:
+      price:
         description: "Candle price type"
         required: true
         type: choice
@@ -39,7 +39,7 @@ on:
         default: "0"
 
       first_exchange:
-        description: "Preferred exchange, tried first (optional, e.g. gateio)"
+        description: "Preferred exchange (optional, e.g. gateio)"
         required: false
         default: ""
 
@@ -56,17 +56,9 @@ jobs:
 
     steps:
 
-      # ================================================
-      # CHECKOUT
-      # ================================================
-
       - name: Checkout repository
         uses: actions/checkout@v4
 
-
-      # ================================================
-      # PYTHON
-      # ================================================
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -74,21 +66,13 @@ jobs:
           python-version: "3.11"
 
 
-      # ================================================
-      # INSTALL DEPENDENCIES
-      # ================================================
-
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install pandas numpy ccxt matplotlib
 
 
-      # ================================================
-      # RUN BACKTEST
-      # ================================================
-
-      - name: Run backtest (all 5 timeframes)
+      - name: Run backtest - all timeframes
         shell: bash
         run: |
 
@@ -102,13 +86,13 @@ jobs:
 
           echo ""
           echo "=========================================="
-          echo "Checking backtest script"
+          echo "Finding Python backtest file"
           echo "=========================================="
 
-          FILE="./luxalgo_backtest.py"
+          FILE="./pivot backtest.py"
 
           if [ ! -f "$FILE" ]; then
-            echo "ERROR: luxalgo_backtest.py nahi mili."
+            echo "ERROR: pivot backtest.py nahi mili."
             echo ""
             echo "Available files:"
             ls -lah
@@ -125,7 +109,7 @@ jobs:
           python "$FILE" \
             --pair "${{ github.event.inputs.pair }}" \
             --days "${{ github.event.inputs.days }}" \
-            --price "${{ github.event.inputs.price_type }}" \
+            --price "${{ github.event.inputs.price }}" \
             --lev "${{ github.event.inputs.leverage }}" \
             --margin "${{ github.event.inputs.margin }}" \
             --sl "${{ github.event.inputs.stop_loss }}" \
@@ -162,10 +146,6 @@ jobs:
             backtest_all_trades.csv \
             equity_all.png
 
-
-      # ================================================
-      # UPLOAD RESULTS
-      # ================================================
 
       - name: Upload results
         uses: actions/upload-artifact@v4
