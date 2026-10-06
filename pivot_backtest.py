@@ -21,6 +21,7 @@ Total position       = Rs 10,000
 25% position:
     Runner
     After 75% TP is hit -> SL moves to BREAKEVEN
+    Breakeven starts from the NEXT candle after TP.
     Runner can continue until:
         - Breakeven
         - Opposite pivot/reversal
@@ -34,16 +35,11 @@ Outputs:
     backtest_all_trades.csv
     backtest_summary.csv
     equity_all.png
-
-Example:
-python pivot_backtest.py --pair BTCUSDT --days 30 \
---price LAST_PRICE --lev 10 --margin 1000 --sl 4
 """
 
 import argparse
 import os
 import time
-import numpy as np
 import pandas as pd
 
 
@@ -54,28 +50,22 @@ import pandas as pd
 MARGIN = 1000.0
 LEV = 10.0
 
-# Maintenance margin
 MMR = 0.005
 
-# Fee per side
 FEE_PCT = 0.10
 
-# Optional SL
-# 0 = OFF
 SL = 0.0
+
 
 # =========================================================
 # PARTIAL TP CONFIGURATION
 # =========================================================
 
-# 75% position closes at +2% price movement
 TP_PCT = 2.0
 
 TP_PART = 0.75
 RUNNER_PART = 0.25
 
-# After 75% TP:
-# Remaining 25% SL moves to entry
 BREAKEVEN_AFTER_TP = True
 
 
@@ -174,7 +164,10 @@ def fetch(pair, tf, days, warmup, price, first=""):
 
         try:
 
-            ex = getattr(ccxt, name)(
+            ex = getattr(
+                ccxt,
+                name
+            )(
                 {
                     "enableRateLimit": True
                 }
@@ -325,13 +318,8 @@ def backtest(df, length, days, tf):
         - pd.Timedelta(days=days)
     )
 
-    # =====================================================
-    # IMPORTANT
-    # =====================================================
-
     trades = []
 
-    # FIX FOR npv ERROR
     npv = 0
 
     # =====================================================
@@ -343,16 +331,13 @@ def backtest(df, length, days, tf):
     epx = None
     et = None
 
-    # Unique trade number
     trade_id = 0
 
     # =====================================================
     # POSITION SIZE
     # =====================================================
 
-    notional = (
-        MARGIN * LEV
-    )
+    notional = MARGIN * LEV
 
     tp_notional = (
         notional * TP_PART
@@ -363,15 +348,13 @@ def backtest(df, length, days, tf):
     )
 
     # =====================================================
-    # TP DISTANCE
+    # TP
     # =====================================================
 
-    tp_distance = (
-        TP_PCT / 100.0
-    )
+    tp_distance = TP_PCT / 100.0
 
     # =====================================================
-    # LIQUIDATION DISTANCE
+    # LIQUIDATION
     # =====================================================
 
     liq = max(
@@ -380,7 +363,7 @@ def backtest(df, length, days, tf):
     )
 
     # =====================================================
-    # OPTIONAL STOP LOSS
+    # ORIGINAL SL
     # =====================================================
 
     sd = (
@@ -390,18 +373,24 @@ def backtest(df, length, days, tf):
     )
 
     # =====================================================
-    # STATE AFTER TP
+    # TP STATE
     # =====================================================
 
     tp_hit = False
+
+    # VERY IMPORTANT:
+    # BE starts ONLY from candle after TP candle.
+    tp_bar_index = None
+
 
     # =====================================================
     # CLOSE 75% TP
     # =====================================================
 
-    def close_tp(px, tm):
+    def close_tp(px, tm, bar_index):
 
         nonlocal tp_hit
+        nonlocal tp_bar_index
 
         if pos == 1:
 
@@ -424,53 +413,51 @@ def backtest(df, length, days, tf):
             * 2
         )
 
-        net = (
-            gross - fee
-        )
+        net = gross - fee
 
         trades.append({
 
-            "trade_id":
-                trade_id,
+            "trade_id": trade_id,
 
-            "tf":
-                tf,
+            "tf": tf,
 
             "side":
                 "LONG"
                 if pos == 1
                 else "SHORT",
 
-            "entry_time":
-                et,
+            "entry_time": et,
 
-            "entry_price":
-                epx,
+            "entry_price": epx,
 
-            "exit_time":
-                tm,
+            "exit_time": tm,
 
-            "exit_price":
-                px,
+            "exit_price": px,
 
-            "portion":
-                "75%",
+            "portion": "75%",
 
-            "gross_pnl":
-                round(gross, 2),
+            "gross_pnl": round(
+                gross,
+                2
+            ),
 
-            "fees":
-                round(fee, 2),
+            "fees": round(
+                fee,
+                2
+            ),
 
-            "net_pnl":
-                round(net, 2),
+            "net_pnl": round(
+                net,
+                2
+            ),
 
-            "status":
-                "TP 2%"
+            "status": "TP 2%"
 
         })
 
         tp_hit = True
+        tp_bar_index = bar_index
+
 
     # =====================================================
     # CLOSE 25% RUNNER
@@ -503,9 +490,7 @@ def backtest(df, length, days, tf):
             * 2
         )
 
-        net = (
-            gross - fee
-        )
+        net = gross - fee
 
         if status == "LIQUIDATED":
 
@@ -513,45 +498,44 @@ def backtest(df, length, days, tf):
 
         trades.append({
 
-            "trade_id":
-                trade_id,
+            "trade_id": trade_id,
 
-            "tf":
-                tf,
+            "tf": tf,
 
             "side":
                 "LONG"
                 if pos == 1
                 else "SHORT",
 
-            "entry_time":
-                et,
+            "entry_time": et,
 
-            "entry_price":
-                epx,
+            "entry_price": epx,
 
-            "exit_time":
-                tm,
+            "exit_time": tm,
 
-            "exit_price":
-                px,
+            "exit_price": px,
 
-            "portion":
-                "25%",
+            "portion": "25%",
 
-            "gross_pnl":
-                round(gross, 2),
+            "gross_pnl": round(
+                gross,
+                2
+            ),
 
-            "fees":
-                round(fee, 2),
+            "fees": round(
+                fee,
+                2
+            ),
 
-            "net_pnl":
-                round(net, 2),
+            "net_pnl": round(
+                net,
+                2
+            ),
 
-            "status":
-                status
+            "status": status
 
         })
+
 
     # =====================================================
     # CLOSE FULL POSITION
@@ -595,60 +579,50 @@ def backtest(df, length, days, tf):
 
         trades.append({
 
-            "trade_id":
-                trade_id,
+            "trade_id": trade_id,
 
-            "tf":
-                tf,
+            "tf": tf,
 
             "side":
                 "LONG"
                 if pos == 1
                 else "SHORT",
 
-            "entry_time":
-                et,
+            "entry_time": et,
 
-            "entry_price":
-                epx,
+            "entry_price": epx,
 
-            "exit_time":
-                tm,
+            "exit_time": tm,
 
-            "exit_price":
-                px,
+            "exit_price": px,
 
-            "portion":
-                "100%",
+            "portion": "100%",
 
-            "gross_pnl":
-                round(
-                    max(
-                        gross,
-                        -MARGIN
-                    ),
-                    2
+            "gross_pnl": round(
+                max(
+                    gross,
+                    -MARGIN
                 ),
+                2
+            ),
 
-            "fees":
-                round(
-                    fee,
-                    2
-                ),
+            "fees": round(
+                fee,
+                2
+            ),
 
-            "net_pnl":
-                round(
-                    net,
-                    2
-                ),
+            "net_pnl": round(
+                net,
+                2
+            ),
 
-            "status":
-                status
+            "status": status
 
         })
 
+
     # =====================================================
-    # MAIN BACKTEST LOOP
+    # MAIN LOOP
     # =====================================================
 
     for i in range(
@@ -702,53 +676,68 @@ def backtest(df, length, days, tf):
 
                     close_tp(
                         tp_price,
-                        t.iloc[i]
+                        t.iloc[i],
+                        i
                     )
 
-            # =============================================
-            # 2. AFTER TP -> RUNNER SL = BREAKEVEN
-            # =============================================
-
-            if pos and tp_hit:
-
-                if BREAKEVEN_AFTER_TP:
-
-                    if pos == 1:
-
-                        if low[i] <= epx:
-
-                            close_runner(
-                                epx,
-                                t.iloc[i],
-                                "BREAKEVEN"
-                            )
-
-                            pos = 0
-                            epx = None
-                            et = None
-                            tp_hit = False
-
-                            continue
-
-                    else:
-
-                        if high[i] >= epx:
-
-                            close_runner(
-                                epx,
-                                t.iloc[i],
-                                "BREAKEVEN"
-                            )
-
-                            pos = 0
-                            epx = None
-                            et = None
-                            tp_hit = False
-
-                            continue
 
             # =============================================
-            # 3. OPTIONAL ORIGINAL SL
+            # 2. BREAKEVEN
+            #
+            # IMPORTANT:
+            # Do NOT check BE on TP candle itself.
+            # BE starts from NEXT candle.
+            # =============================================
+
+            if (
+                pos
+                and tp_hit
+                and BREAKEVEN_AFTER_TP
+                and tp_bar_index is not None
+                and i > tp_bar_index
+            ):
+
+                if pos == 1:
+
+                    if low[i] <= epx:
+
+                        close_runner(
+                            epx,
+                            t.iloc[i],
+                            "BREAKEVEN"
+                        )
+
+                        pos = 0
+                        epx = None
+                        et = None
+                        tp_hit = False
+                        tp_bar_index = None
+
+                        continue
+
+                else:
+
+                    if high[i] >= epx:
+
+                        close_runner(
+                            epx,
+                            t.iloc[i],
+                            "BREAKEVEN"
+                        )
+
+                        pos = 0
+                        epx = None
+                        et = None
+                        tp_hit = False
+                        tp_bar_index = None
+
+                        continue
+
+
+            # =============================================
+            # 3. ORIGINAL SL
+            #
+            # Only before TP.
             # =============================================
 
             if pos and not tp_hit and sd:
@@ -776,6 +765,7 @@ def backtest(df, length, days, tf):
                         epx = None
                         et = None
                         tp_hit = False
+                        tp_bar_index = None
 
                         continue
 
@@ -802,8 +792,10 @@ def backtest(df, length, days, tf):
                         epx = None
                         et = None
                         tp_hit = False
+                        tp_bar_index = None
 
                         continue
+
 
             # =============================================
             # 4. LIQUIDATION
@@ -844,6 +836,7 @@ def backtest(df, length, days, tf):
                         epx = None
                         et = None
                         tp_hit = False
+                        tp_bar_index = None
 
                         continue
 
@@ -880,8 +873,10 @@ def backtest(df, length, days, tf):
                         epx = None
                         et = None
                         tp_hit = False
+                        tp_bar_index = None
 
                         continue
+
 
         # =================================================
         # PIVOT DETECTION
@@ -917,11 +912,10 @@ def backtest(df, length, days, tf):
 
             continue
 
-        # Count pivot
         npv += 1
 
-        # Pivot high -> SHORT
-        # Pivot low  -> LONG
+        # Pivot HIGH -> SHORT
+        # Pivot LOW  -> LONG
 
         direction = (
             -1
@@ -929,10 +923,10 @@ def backtest(df, length, days, tf):
             else 1
         )
 
-        # Same direction
         if direction == pos:
 
             continue
+
 
         # =================================================
         # OPPOSITE PIVOT
@@ -942,7 +936,6 @@ def backtest(df, length, days, tf):
 
             if tp_hit:
 
-                # Only 25% runner remains
                 close_runner(
                     close[i],
                     t.iloc[i],
@@ -951,12 +944,12 @@ def backtest(df, length, days, tf):
 
             else:
 
-                # Entire 100% position remains
                 close_full(
                     close[i],
                     t.iloc[i],
                     "closed"
                 )
+
 
         # =================================================
         # OPEN NEW POSITION
@@ -971,5 +964,649 @@ def backtest(df, length, days, tf):
         et = t.iloc[i]
 
         tp_hit = False
+        tp_bar_index = None
 
-    # ============================================
+
+    # =====================================================
+    # CLOSE OPEN POSITION AT LAST PRICE
+    # =====================================================
+
+    if pos:
+
+        if tp_hit:
+
+            close_runner(
+                close[-1],
+                t.iloc[-1],
+                "open (MTM)"
+            )
+
+        else:
+
+            close_full(
+                close[-1],
+                t.iloc[-1],
+                "open (MTM)"
+            )
+
+
+    return (
+        pd.DataFrame(trades),
+        npv
+    )
+
+
+# =========================================================
+# SUMMARY
+# =========================================================
+
+def summarize(
+    tf,
+    tr,
+    npv,
+    err=""
+):
+
+    s = dict(
+
+        tf=tf,
+
+        pivots=npv,
+
+        trades=0,
+
+        long=0,
+
+        short=0,
+
+        wins=0,
+
+        win_pct=0.0,
+
+        net_pnl=0.0,
+
+        realised=0.0,
+
+        open_mtm=0.0,
+
+        liq=0,
+
+        sl_hits=0,
+
+        tp_hits=0,
+
+        breakeven=0,
+
+        fees=0.0,
+
+        profit_factor=0.0,
+
+        max_dd=0.0,
+
+        note=err
+    )
+
+
+    if tr.empty:
+
+        return s
+
+
+    w = tr[
+        tr.net_pnl > 0
+    ]
+
+    l = tr[
+        tr.net_pnl <= 0
+    ]
+
+
+    eq = pd.concat(
+
+        [
+            pd.Series([0.0]),
+            tr.net_pnl.cumsum()
+        ],
+
+        ignore_index=True
+    )
+
+
+    gross_loss = abs(
+        l.net_pnl.sum()
+    )
+
+
+    s.update(
+
+        trades=len(tr),
+
+        long=int(
+            (tr.side == "LONG").sum()
+        ),
+
+        short=int(
+            (tr.side == "SHORT").sum()
+        ),
+
+        wins=len(w),
+
+        win_pct=round(
+            len(w)
+            / len(tr)
+            * 100,
+            1
+        ),
+
+        net_pnl=round(
+            tr.net_pnl.sum(),
+            2
+        ),
+
+        realised=round(
+            tr[
+                tr.status != "open (MTM)"
+            ].net_pnl.sum(),
+            2
+        ),
+
+        open_mtm=round(
+            tr[
+                tr.status == "open (MTM)"
+            ].net_pnl.sum(),
+            2
+        ),
+
+        liq=int(
+            (
+                tr.status
+                == "LIQUIDATED"
+            ).sum()
+        ),
+
+        sl_hits=int(
+            (
+                tr.status
+                == "STOP LOSS"
+            ).sum()
+        ),
+
+        tp_hits=int(
+            (
+                tr.status
+                == "TP 2%"
+            ).sum()
+        ),
+
+        breakeven=int(
+            (
+                tr.status
+                == "BREAKEVEN"
+            ).sum()
+        ),
+
+        fees=round(
+            tr.fees.sum(),
+            2
+        ),
+
+        profit_factor=round(
+            w.net_pnl.sum()
+            / gross_loss,
+            2
+        )
+        if gross_loss
+        else float("inf"),
+
+        max_dd=round(
+            (
+                eq
+                - eq.cummax()
+            ).min(),
+            2
+        )
+    )
+
+    return s
+
+
+# =========================================================
+# EQUITY PLOT
+# =========================================================
+
+def plot_all(
+    all_tr,
+    path
+):
+
+    try:
+
+        import matplotlib
+
+        matplotlib.use("Agg")
+
+        import matplotlib.pyplot as plt
+
+    except ImportError:
+
+        return
+
+
+    fig, ax = plt.subplots(
+        figsize=(10, 5)
+    )
+
+
+    for tf, g in all_tr.groupby(
+        "tf",
+        sort=False
+    ):
+
+        g = g.sort_values(
+            "exit_time"
+        )
+
+        ax.step(
+            g.exit_time,
+            g.net_pnl.cumsum(),
+            where="post",
+            marker="o",
+            label=tf
+        )
+
+
+    ax.axhline(
+        0,
+        color="gray",
+        lw=0.8
+    )
+
+    ax.set_title(
+        "Equity curves - all timeframes (Rs, net of fees)"
+    )
+
+    ax.set_xlabel(
+        "Exit time"
+    )
+
+    ax.set_ylabel(
+        "Net P&L (Rs)"
+    )
+
+    ax.legend()
+
+    fig.autofmt_xdate()
+
+    fig.tight_layout()
+
+    fig.savefig(
+        path,
+        dpi=120
+    )
+
+    plt.close(fig)
+
+
+# =========================================================
+# GITHUB SUMMARY
+# =========================================================
+
+def gh_summary(
+    sm,
+    args,
+    pair
+):
+
+    path = os.environ.get(
+        "GITHUB_STEP_SUMMARY"
+    )
+
+    if not path:
+
+        return
+
+
+    with open(
+        path,
+        "a",
+        encoding="utf-8"
+    ) as f:
+
+        f.write(
+
+            f"## Pivot Backtest | "
+            f"{pair} | "
+            f"{args.price} | "
+            f"last {args.days} days | "
+            f"length {args.length} | "
+            f"{LEV:g}x | "
+            f"75% TP {TP_PCT:g}% | "
+            f"25% runner BE after TP\n\n"
+        )
+
+
+        f.write(
+
+            "| TF | Trades | Win% | Net P&L | "
+            "Realised | Open (MTM) | TP hits | "
+            "BE | Liquidated | SL hits | Fees | "
+            "PF | Max DD |\n"
+        )
+
+
+        f.write(
+
+            "|---|---:|---:|---:|---:|---:|"
+            "---:|---:|---:|---:|---:|---:|---:|\n"
+        )
+
+
+        for r in sm.itertuples():
+
+            f.write(
+
+                f"| {r.tf} | "
+                f"{r.trades} | "
+                f"{r.win_pct}% | "
+                f"{r.net_pnl} | "
+                f"{r.realised} | "
+                f"{r.open_mtm} | "
+                f"{r.tp_hits} | "
+                f"{r.breakeven} | "
+                f"{r.liq} | "
+                f"{r.sl_hits} | "
+                f"{r.fees} | "
+                f"{r.profit_factor} | "
+                f"{r.max_dd} |"
+                f"{' ' + r.note if r.note else ''}\n"
+            )
+
+
+        f.write(
+
+            f"\nMargin Rs {MARGIN:.0f} x "
+            f"{LEV:g}x = "
+            f"Rs {MARGIN * LEV:.0f} position. "
+            f"75% ({TP_PART:.0%}) exits at "
+            f"+{TP_PCT:g}% price move; "
+            f"remaining 25% runner moves SL "
+            f"to breakeven from the NEXT candle "
+            f"after TP. "
+            f"Fee {FEE_PCT}%/side on each portion. "
+            f"Funding & slippage ignored.\n"
+        )
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+if __name__ == "__main__":
+
+    ap = argparse.ArgumentParser()
+
+
+    ap.add_argument(
+        "--pair",
+        default="BTCUSDT"
+    )
+
+
+    ap.add_argument(
+        "--days",
+        type=int,
+        default=30
+    )
+
+
+    ap.add_argument(
+        "--price",
+        default="LAST_PRICE",
+        choices=list(EXCHANGES)
+    )
+
+
+    ap.add_argument(
+        "--length",
+        type=int,
+        default=50
+    )
+
+
+    ap.add_argument(
+        "--tfs",
+        default=",".join(TFS)
+    )
+
+
+    ap.add_argument(
+        "--first",
+        default="",
+        help="preferred exchange tried first (ccxt id)"
+    )
+
+
+    ap.add_argument(
+        "--lev",
+        type=float,
+        default=10
+    )
+
+
+    ap.add_argument(
+        "--margin",
+        type=float,
+        default=1000
+    )
+
+
+    ap.add_argument(
+        "--sl",
+        type=float,
+        default=0,
+        help="stop-loss %% of price, 0 = off"
+    )
+
+
+    a = ap.parse_args()
+
+
+    LEV = a.lev
+
+    MARGIN = a.margin
+
+    SL = a.sl
+
+
+    pair = norm_pair(
+        a.pair
+    )
+
+
+    all_tr = []
+
+    rows = []
+
+
+    for tf in a.tfs.split(","):
+
+        tf = tf.strip()
+
+        if not tf:
+
+            continue
+
+
+        try:
+
+            df = fetch(
+
+                pair,
+
+                tf,
+
+                a.days,
+
+                2 * a.length + 5,
+
+                a.price,
+
+                a.first.strip().lower()
+            )
+
+
+            tr, npv = backtest(
+
+                df,
+
+                a.length,
+
+                a.days,
+
+                tf
+            )
+
+
+            rows.append(
+
+                summarize(
+
+                    tf,
+
+                    tr,
+
+                    npv
+                )
+            )
+
+
+            if not tr.empty:
+
+                all_tr.append(
+                    tr
+                )
+
+
+        except Exception as e:
+
+            print(
+                f"[{tf}] ERROR: {e}"
+            )
+
+
+            rows.append(
+
+                summarize(
+
+                    tf,
+
+                    pd.DataFrame(),
+
+                    0,
+
+                    "ERROR: "
+                    + str(e)[:300]
+                )
+            )
+
+
+    sm = pd.DataFrame(
+        rows
+    )
+
+
+    print(
+        "\n"
+        + "=" * 90
+    )
+
+
+    print(
+
+        f"{pair} | "
+        f"{a.price} | "
+        f"last {a.days}d | "
+        f"length {a.length} | "
+        f"margin Rs {MARGIN:.0f} x "
+        f"{LEV:g}x | "
+        f"75% TP {TP_PCT:g}% | "
+        f"25% runner BE | "
+        f"SL {SL:g}% | "
+        f"fee {FEE_PCT}%/side"
+    )
+
+
+    print(
+        "=" * 90
+    )
+
+
+    print(
+
+        sm.drop(
+            columns="note"
+        ).to_string(
+            index=False
+        )
+    )
+
+
+    sm.to_csv(
+        "backtest_summary.csv",
+        index=False
+    )
+
+
+    if all_tr:
+
+        at = pd.concat(
+
+            all_tr,
+
+            ignore_index=True
+        )
+
+
+        at.to_csv(
+
+            "backtest_all_trades.csv",
+
+            index=False
+        )
+
+
+        print(
+
+            "\nALL TRADES\n"
+            + at.to_string(
+                index=False
+            )
+        )
+
+
+        plot_all(
+
+            at,
+
+            "equity_all.png"
+        )
+
+
+    else:
+
+        pd.DataFrame().to_csv(
+
+            "backtest_all_trades.csv",
+
+            index=False
+        )
+
+
+    gh_summary(
+
+        sm,
+
+        a,
+
+        pair
+    )
