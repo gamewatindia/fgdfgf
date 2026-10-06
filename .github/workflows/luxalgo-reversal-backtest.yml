@@ -1,52 +1,56 @@
-name: Shark LuxAlgo Reversal Backtest
+name: LuxAlgo Pivot Reversal Backtest
 
 on:
   workflow_dispatch:
     inputs:
       pair:
-        description: "Shark USDT Pair"
+        description: "Shark Exchange USDT pair"
         required: true
-        default: "BTCUSDT"
+        default: "BRUSDT"
+
       days:
         description: "Historical days"
         required: true
         default: "30"
+
       price_type:
-        description: "Candle price type"
+        description: "Price type"
         required: true
+        default: "LAST_PRICE"
         type: choice
         options:
           - LAST_PRICE
           - MARK_PRICE
-        default: LAST_PRICE
 
 jobs:
   backtest:
+
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
 
-      - name: Install dependencies
-        run: pip install pandas requests
-
-      - name: Download Shark 5m candles
+      - name: Install packages
         run: |
-          python download_shark_klines.py             --pair "${{ inputs.pair }}"             --interval 5m             --days "${{ inputs.days }}"             --price-type "${{ inputs.price_type }}"             --output "data/${{ inputs.pair }}_5m.csv"
+          python -m pip install --upgrade pip
+          pip install pandas requests
 
       - name: Run backtest
         run: |
-          python luxalgo_backtest.py             --data "data/${{ inputs.pair }}_5m.csv"             --symbol "${{ inputs.pair }}"             --out results
-
-      - name: Show summary
-        run: cat results/summary.csv
+          python luxalgo_backtest.py \
+            --pair "${{ github.event.inputs.pair }}" \
+            --days "${{ github.event.inputs.days }}" \
+            --price-type "${{ github.event.inputs.price_type }}"
 
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: luxalgo-reversal-${{ inputs.pair }}
+          name: luxalgo-${{ github.event.inputs.pair }}-results
           path: results/
