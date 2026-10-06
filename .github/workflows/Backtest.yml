@@ -24,17 +24,17 @@ on:
           - INDEX_PRICE
 
       leverage:
-        description: "Leverage"
+        description: "Leverage (x)"
         required: false
         default: "10"
 
       margin:
-        description: "Margin per trade"
+        description: "Margin per trade (Rs)"
         required: false
         default: "1000"
 
       stop_loss:
-        description: "Stop loss % (0 = off)"
+        description: "Stop-loss % of price (0 = off)"
         required: false
         default: "0"
 
@@ -56,7 +56,7 @@ jobs:
 
     steps:
 
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
 
@@ -99,16 +99,17 @@ jobs:
           echo "Checking Python file"
           echo "========================================"
 
-          FILE="./pivot_backtest"
+          FILE="./pivot_backtest.py"
 
           if [ ! -f "$FILE" ]; then
-            echo "ERROR: pivot_backtest file nahi mili."
+            echo "ERROR: pivot_backtest.py nahi mili."
             echo ""
+            echo "Available files:"
             ls -lah
             exit 1
           fi
 
-          echo "Using: $FILE"
+          echo "Using Python file: $FILE"
 
           echo ""
           echo "========================================"
@@ -127,16 +128,27 @@ jobs:
 
           echo ""
           echo "========================================"
-          echo "Checking results"
+          echo "Checking output files"
           echo "========================================"
 
-          test -f backtest_summary.csv
-          test -f backtest_all_trades.csv
-          test -f equity_all.png
+          if [ ! -f "backtest_summary.csv" ]; then
+            echo "ERROR: backtest_summary.csv nahi bani."
+            exit 1
+          fi
+
+          if [ ! -f "backtest_all_trades.csv" ]; then
+            echo "ERROR: backtest_all_trades.csv nahi bani."
+            exit 1
+          fi
+
+          if [ ! -f "equity_all.png" ]; then
+            echo "ERROR: equity_all.png nahi bani."
+            exit 1
+          fi
 
           echo ""
           echo "========================================"
-          echo "BACKTEST SUCCESS"
+          echo "BACKTEST COMPLETED SUCCESSFULLY"
           echo "========================================"
 
           ls -lh \
@@ -147,10 +159,8 @@ jobs:
 
       - name: Upload results
         uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: backtest-results
           path: |
-            backtest_summary.csv
-            backtest_all_trades.csv
-            equity_all.png
-          if-no-files-found: error
+           
