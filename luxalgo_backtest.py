@@ -31,24 +31,27 @@ INTERVAL_MS = 5 * 60 * 1000
 
 
 # =========================================================
-# SHARK API
+# SHARK API - BACKWARD PAGINATION
 # =========================================================
 
 def download_klines(pair, days, price_type):
 
     now = datetime.now(timezone.utc)
 
-    start = now - timedelta(days=days)
-
-    start_ms = int(
-        start.timestamp() * 1000
+    requested_start = (
+        now - timedelta(days=days)
     )
 
-    end_ms = int(
+    requested_start_ms = int(
+        requested_start.timestamp() * 1000
+    )
+
+    requested_end_ms = int(
         now.timestamp() * 1000
     )
 
-    cursor = start_ms
+    # We start from the present and move BACKWARD.
+    cursor_end = requested_end_ms
 
     all_rows = []
 
@@ -73,19 +76,17 @@ def download_klines(pair, days, price_type):
     print(f"Price type : {price_type}")
     print()
 
-    while cursor < end_ms:
+    while cursor_end > requested_start_ms:
 
         page += 1
 
         # -------------------------------------------------
         # IMPORTANT:
-        # Shark Kline endpoint is POST.
         #
-        # URL:
-        # /v1/market/klines?priceType=LAST_PRICE
+        # Shark returns the latest 1000 candles before
+        # endTime.
         #
-        # Body:
-        # pair, interval, startTime, endTime, limit
+        # Therefore we paginate BACKWARD.
         # -------------------------------------------------
 
         url = (
@@ -96,8 +97,7 @@ def download_klines(pair, days, price_type):
         payload = {
             "pair": pair.upper(),
             "interval": "5m",
-            "startTime": cursor,
-            "endTime": end_ms,
+            "endTime": cursor_end,
             "limit": LIMIT
         }
 
@@ -109,7 +109,11 @@ def download_klines(pair, days, price_type):
                 timeout=30
             )
 
-            if response.status_code != 200:
+            # 200 and 201 are both accepted because
+            # the Shark endpoint has returned 201 in
+            # the user's GitHub run.
+
+            if response.status_code not in (200, 201):
 
                 print()
                 print(
@@ -133,7 +137,7 @@ def download_klines(pair, days, price_type):
             raise
 
         # -------------------------------------------------
-        # Response
+        # RESPONSE
         # -------------------------------------------------
 
         if isinstance(result, dict):
@@ -154,7 +158,8 @@ def download_klines(pair, days, price_type):
         if not data:
 
             print(
-                f"Page {page}: no more candles."
+                f"Page {page}: "
+                "No more candles."
             )
 
             break
@@ -164,10 +169,6 @@ def download_klines(pair, days, price_type):
         for row in data:
 
             try:
-
-                # -----------------------------------------
-                # Dictionary response
-                # -----------------------------------------
 
                 if isinstance(row, dict):
 
@@ -212,10 +213,6 @@ def download_klines(pair, days, price_type):
                         )
                     )
 
-                # -----------------------------------------
-                # Array response
-                # -----------------------------------------
-
                 elif isinstance(
                     row,
                     (list, tuple)
@@ -224,25 +221,12 @@ def download_klines(pair, days, price_type):
                     if len(row) < 5:
                         continue
 
-                    ts = int(
-                        row[0]
-                    )
+                    ts = int(row[0])
 
-                    open_price = float(
-                        row[1]
-                    )
-
-                    high_price = float(
-                        row[2]
-                    )
-
-                    low_price = float(
-                        row[3]
-                    )
-
-                    close_price = float(
-                        row[4]
-                    )
+                    open_price = float(row[1])
+                    high_price = float(row[2])
+                    low_price = float(row[3])
+                    close_price = float(row[4])
 
                     volume = (
                         float(row[5])
@@ -301,12 +285,20 @@ def download_klines(pair, days, price_type):
         if not parsed:
 
             raise RuntimeError(
-                "Shark API returned data, "
+                "Shark returned data, "
                 "but candles could not be parsed."
             )
 
-        all_rows.extend(
-            parsed
+        # Add page
+        all_rows.extend(parsed)
+
+        # -------------------------------------------------
+        # Find OLDEST candle in this page
+        # -------------------------------------------------
+
+        oldest_ts = min(
+            x["_ts"]
+            for x in parsed
         )
 
         newest_ts = max(
@@ -317,35 +309,40 @@ def download_klines(pair, days, price_type):
         print(
             f"Page {page}: "
             f"{len(parsed)} candles | "
-            f"Through: "
+            f"{pd.to_datetime(oldest_ts, unit='ms', utc=True)}"
+            f" -> "
             f"{pd.to_datetime(newest_ts, unit='ms', utc=True)}"
         )
 
         # -------------------------------------------------
-        # NEXT PAGE
+        # BACKWARD PAGINATION
         # -------------------------------------------------
 
         next_cursor = (
-            newest_ts +
-            INTERVAL_MS
+            oldest_ts - 1
         )
 
-        if next_cursor <= cursor:
+        if next_cursor >= cursor_end:
 
             raise RuntimeError(
-                "Pagination cursor did not advance."
+                "Backward pagination did not move."
             )
 
-        cursor = next_cursor
+        cursor_end = next_cursor
 
-        if newest_ts >= end_ms:
+        # -------------------------------------------------
+        # Stop once we have crossed requested start
+        # -------------------------------------------------
+
+        if oldest_ts <= requested_start_ms:
 
             break
 
-        time.sleep(0.15)
+        # Shark public endpoint has rate limits.
+        time.sleep(0.20)
 
     # =====================================================
-    # DATAFRAME
+    # NO DATA
     # =====================================================
 
     if not all_rows:
@@ -354,27 +351,31 @@ def download_klines(pair, days, price_type):
             "No candle data received from Shark Exchange."
         )
 
+    # =====================================================
+    # DATAFRAME
+    # =====================================================
+
     df = pd.DataFrame(
         all_rows
     )
 
-    # Remove duplicate candles
+    # Remove duplicates
     df.drop_duplicates(
         subset=["_ts"],
         keep="last",
         inplace=True
     )
 
-    # Sort
+    # Sort oldest -> newest
     df.sort_values(
         "_ts",
         inplace=True
     )
 
-    # Requested period
+    # Keep requested period
     df = df[
-        (df["_ts"] >= start_ms) &
-        (df["_ts"] <= end_ms)
+        (df["_ts"] >= requested_start_ms) &
+        (df["_ts"] <= requested_end_ms)
     ].copy()
 
     # =====================================================
@@ -401,6 +402,10 @@ def download_klines(pair, days, price_type):
             f"received. Expected much more."
         )
 
+    # =====================================================
+    # DOWNLOAD SUMMARY
+    # =====================================================
+
     print()
     print("=" * 60)
     print("DOWNLOAD COMPLETE")
@@ -411,11 +416,23 @@ def download_klines(pair, days, price_type):
     )
 
     print(
-        f"From    : {df['timestamp'].iloc[0]}"
+        f"From    : "
+        f"{df['timestamp'].iloc[0]}"
     )
 
     print(
-        f"To      : {df['timestamp'].iloc[-1]}"
+        f"To      : "
+        f"{df['timestamp'].iloc[-1]}"
+    )
+
+    expected = (
+        days *
+        24 *
+        12
+    )
+
+    print(
+        f"Expected: ~{expected:,}"
     )
 
     return df[
@@ -431,7 +448,7 @@ def download_klines(pair, days, price_type):
 
 
 # =========================================================
-# PIVOTS
+# PIVOT HIGH
 # =========================================================
 
 def is_pivot_high(df, index):
@@ -465,6 +482,10 @@ def is_pivot_high(df, index):
         value >= right.max()
     )
 
+
+# =========================================================
+# PIVOT LOW
+# =========================================================
 
 def is_pivot_low(df, index):
 
@@ -534,9 +555,9 @@ def run_backtest(df, symbol):
     running_high = None
     running_low = None
 
-    # -----------------------------------------------------
-    # Start after enough candles for pivot confirmation
-    # -----------------------------------------------------
+    # =====================================================
+    # LOOP
+    # =====================================================
 
     for i in range(
         PIVOT_LENGTH * 2,
@@ -690,8 +711,8 @@ def run_backtest(df, symbol):
             exit_reason = None
             raw_exit = None
 
-            # If both SL and target are touched
-            # in the same candle, SL wins.
+            # SL has priority when both
+            # are touched inside one candle.
 
             if hit_sl:
 
@@ -712,7 +733,7 @@ def run_backtest(df, symbol):
             if exit_reason:
 
                 # -------------------------------------------------
-                # EXIT SLIPPAGE
+                # Exit price with slippage
                 # -------------------------------------------------
 
                 if side == "LONG":
@@ -740,7 +761,7 @@ def run_backtest(df, symbol):
                     ) * position["qty"]
 
                 # -------------------------------------------------
-                # FEES
+                # Fees
                 # -------------------------------------------------
 
                 exit_fee = calculate_fee(
@@ -760,7 +781,7 @@ def run_backtest(df, symbol):
                 )
 
                 # -------------------------------------------------
-                # ACTUAL PLANNED RR
+                # RR
                 # -------------------------------------------------
 
                 risk = abs(
@@ -866,7 +887,7 @@ def run_backtest(df, symbol):
                 continue
 
         # =================================================
-        # WAIT FOR BREAKOUT ENTRY
+        # PENDING ENTRY
         # =================================================
 
         if (
@@ -1069,7 +1090,6 @@ def run_backtest(df, symbol):
 
             # -------------------------------------------------
             # LONG
-            # Support touch + bullish candle
             # -------------------------------------------------
 
             support_hits = [
@@ -1141,7 +1161,6 @@ def run_backtest(df, symbol):
 
             # -------------------------------------------------
             # SHORT
-            # Resistance touch + bearish candle
             # -------------------------------------------------
 
             elif c < o:
@@ -1247,28 +1266,20 @@ def create_summary(trades):
         }])
 
     wins = trades[
-        trades[
-            "net_pnl_inr"
-        ] > 0
+        trades["net_pnl_inr"] > 0
     ]
 
     losses = trades[
-        trades[
-            "net_pnl_inr"
-        ] <= 0
+        trades["net_pnl_inr"] <= 0
     ]
 
     gross_profit = float(
-        wins[
-            "net_pnl_inr"
-        ].sum()
+        wins["net_pnl_inr"].sum()
     )
 
     gross_loss = abs(
         float(
-            losses[
-                "net_pnl_inr"
-            ].sum()
+            losses["net_pnl_inr"].sum()
         )
     )
 
@@ -1464,7 +1475,7 @@ def main():
     )
 
     # =====================================================
-    # SAVE
+    # SAVE RESULTS
     # =====================================================
 
     output_dir = Path(
