@@ -4,10 +4,11 @@ Stop-and-reverse: confirmed pivot LOW -> LONG, confirmed pivot HIGH -> SHORT.
 Entry = close of the bar where pivot is confirmed (no look-ahead).
 Rs 1000 margin per trade with LEVERAGE (default 10x) -> position = Rs 10,000.
 Liquidation modelled (10x: ~9.5% adverse move = full margin lost).
+Optional stop-loss (--sl %, price move against you) exits BEFORE liquidation.
 Fee is charged on the full position size. Only trades entered in last DAYS days.
 
 Outputs: backtest_all_trades.csv, backtest_summary.csv, equity_all.png
-Run: python pivot_backtest.py --pair BTCUSDT --days 30 --price LAST_PRICE --lev 10 --margin 1000
+Run: python pivot_backtest.py --pair BTCUSDT --days 30 --price LAST_PRICE --lev 10 --margin 1000 --sl 4
 """
 import argparse, os, time
 import numpy as np
@@ -17,6 +18,7 @@ MARGIN = 1000.0             # Rs margin per trade
 LEV = 10                    # leverage
 MMR = 0.005                 # maintenance margin (0.5%)
 FEE_PCT = 0.10              # % per side, on full position size
+SL = 0.0                    # stop-loss in % of price (0 = off)
 TFS = ["5m", "15m", "30m", "1h", "4h"]
 # Tried in order until one has the pair. (bybit/binance.com block GitHub's US servers,
 # so they are kept last; gateio/mexc/kucoin/bitget list far more altcoins.)
@@ -81,6 +83,7 @@ def backtest(df, length, days, tf):
     trades, pos, epx, et, npv = [], 0, None, None, 0
     notional = MARGIN * LEV
     liq = max(1 / LEV - MMR, 0.001)          # adverse move that wipes the margin
+    sd = SL / 100 if 0 < SL / 100 < liq else None   # stop distance (only useful if before liquidation)
 
     def close_trade(px, tm, status):
         g = notional * pos * (px / epx - 1)
@@ -94,10 +97,12 @@ def backtest(df, length, days, tf):
                            net_pnl=round(net, 2), status=status))
 
     for i in range(2 * length, len(df)):
-        if pos == 1 and low[i] <= epx * (1 - liq):
-            close_trade(epx * (1 - liq), t.iloc[i], "LIQUIDATED"); pos = 0
-        elif pos == -1 and high[i] >= epx * (1 + liq):
-            close_trade(epx * (1 + liq), t.iloc[i], "LIQUIDATED"); pos = 0
+        if pos:
+            adv = (epx - low[i]) / epx if pos == 1 else (high[i] - epx) / epx   # adverse move this bar
+            if sd and adv >= sd:
+                close_trade(epx * (1 - pos * sd), t.iloc[i], "STOP LOSS"); pos = 0
+            elif adv >= liq:
+                close_trade(epx * (1 - pos * liq), t.iloc[i], "LIQUIDATED"); pos = 0
         c = i - length
         wh, wl = high[c - length: i + 1], low[c - length: i + 1]
         ph = high[c] == wh.max() and (wh == high[c]).sum() == 1
@@ -118,7 +123,7 @@ def backtest(df, length, days, tf):
 
 def summarize(tf, tr, npv, err=""):
     s = dict(tf=tf, pivots=npv, trades=0, long=0, short=0, wins=0, win_pct=0.0, net_pnl=0.0,
-             realised=0.0, open_mtm=0.0, liq=0, fees=0.0, profit_factor=0.0, max_dd=0.0, note=err)
+             realised=0.0, open_mtm=0.0, liq=0, sl_hits=0, fees=0.0, profit_factor=0.0, max_dd=0.0, note=err)
     if tr.empty:
         return s
     w, l = tr[tr.net_pnl > 0], tr[tr.net_pnl <= 0]
@@ -129,6 +134,7 @@ def summarize(tf, tr, npv, err=""):
              realised=round(tr[tr.status != "open (MTM)"].net_pnl.sum(), 2),
              open_mtm=round(tr[tr.status == "open (MTM)"].net_pnl.sum(), 2),
              liq=int((tr.status == "LIQUIDATED").sum()),
+             sl_hits=int((tr.status == "STOP LOSS").sum()),
              fees=round(tr.fees.sum(), 2),
              profit_factor=round(w.net_pnl.sum() / gl, 2) if gl else float("inf"),
              max_dd=round((eq - eq.cummax()).min(), 2))
@@ -155,15 +161,17 @@ def gh_summary(sm, args, pair):
     if not path:
         return
     with open(path, "a") as f:
-        f.write(f"## Pivot Backtest | {pair} | {args.price} | last {args.days} days | length {args.length}\n\n")
-        f.write("| TF | Trades | Win% | Net P&L | Realised | Open (MTM) | Liquidated | Fees | PF | Max DD |\n")
-        f.write("|---|---|---|---|---|---|---|---|---|---|\n")
+        f.write(f"## Pivot Backtest | {pair} | {args.price} | last {args.days} days | length {args.length} | "
+                f"{LEV:g}x | SL {SL:g}%\n\n")
+        f.write("| TF | Trades | Win% | Net P&L | Realised | Open (MTM) | Liquidated | SL hits | Fees | PF | Max DD |\n")
+        f.write("|---|---|---|---|---|---|---|---|---|---|---|\n")
         for r in sm.itertuples():
             f.write(f"| {r.tf} | {r.trades} | {r.win_pct}% | {r.net_pnl} | {r.realised} | "
-                    f"{r.open_mtm} | {r.liq} | {r.fees} | {r.profit_factor} | {r.max_dd} |"
+                    f"{r.open_mtm} | {r.liq} | {r.sl_hits} | {r.fees} | {r.profit_factor} | {r.max_dd} |"
                     f"{' ' + r.note if r.note else ''}\n")
         f.write(f"\nMargin Rs {MARGIN:.0f} x {LEV}x = Rs {MARGIN*LEV:.0f} position, fee {FEE_PCT}%/side "
-                "on position. Funding & slippage ignored. Few trades = low statistical value.\n")
+                "on position. Funding & slippage ignored (SL assumed filled at its price). "
+                "Few trades = low statistical value.\n")
 
 
 if __name__ == "__main__":
@@ -176,8 +184,9 @@ if __name__ == "__main__":
     ap.add_argument("--first", default="", help="preferred exchange tried first (ccxt id)")
     ap.add_argument("--lev", type=float, default=10)
     ap.add_argument("--margin", type=float, default=1000)
+    ap.add_argument("--sl", type=float, default=0, help="stop-loss %% of price, 0 = off")
     a = ap.parse_args()
-    LEV, MARGIN = a.lev, a.margin
+    LEV, MARGIN, SL = a.lev, a.margin, a.sl
     pair = norm_pair(a.pair)
 
     all_tr, rows = [], []
@@ -194,7 +203,7 @@ if __name__ == "__main__":
 
     sm = pd.DataFrame(rows)
     print("\n" + "=" * 78)
-    print(f"{pair} | {a.price} | last {a.days}d | length {a.length} | margin Rs {MARGIN:.0f} x {LEV:g}x | fee {FEE_PCT}%/side")
+    print(f"{pair} | {a.price} | last {a.days}d | length {a.length} | margin Rs {MARGIN:.0f} x {LEV:g}x | SL {SL:g}% | fee {FEE_PCT}%/side")
     print("=" * 78)
     print(sm.drop(columns="note").to_string(index=False))
     sm.to_csv("backtest_summary.csv", index=False)
