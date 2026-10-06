@@ -7,10 +7,12 @@ on:
         description: "USDT Pair (e.g. BTCUSDT)"
         required: true
         default: "BTCUSDT"
+
       days:
         description: "Historical days"
         required: true
         default: "30"
+
       price_type:
         description: "Candle price type"
         required: true
@@ -20,65 +22,157 @@ on:
           - LAST_PRICE
           - MARK_PRICE
           - INDEX_PRICE
+
       leverage:
         description: "Leverage (x)"
         required: false
         default: "10"
+
       margin:
         description: "Margin per trade (Rs)"
         required: false
         default: "1000"
+
       stop_loss:
         description: "Stop-loss % of price (0 = off, e.g. 4 for 10x)"
         required: false
         default: "0"
+
       first_exchange:
         description: "Preferred exchange, tried first (optional, e.g. gateio)"
         required: false
         default: ""
+
       length:
-        description: "Pivot length (optional)"
+        description: "Pivot length"
         required: false
         default: "50"
 
-jobs:
-  backtest:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+jobs:
+
+  backtest:
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # ==================================================
+      # CHECKOUT
+      # ==================================================
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+
+      # ==================================================
+      # PYTHON
+      # ==================================================
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
+
+      # ==================================================
+      # DEPENDENCIES
+      # ==================================================
+
       - name: Install dependencies
-        run: pip install pandas numpy ccxt matplotlib
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy ccxt matplotlib
+
+
+      # ==================================================
+      # RUN BACKTEST
+      # ==================================================
 
       - name: Run backtest (all 5 timeframes)
         shell: bash
         run: |
-          FILE=$(find . -maxdepth 1 -type f -iname 'pivot*backtest*' | head -n 1)
+
+          set -e
+
+          echo "=========================================="
+          echo "Repository files:"
+          echo "=========================================="
+
+          ls -lah
+
+          echo ""
+          echo "=========================================="
+          echo "Finding pivot backtest Python file..."
+          echo "=========================================="
+
+          FILE=$(find . -maxdepth 1 -type f \
+            \( -iname 'pivot_backtest.py' -o -iname 'pivot*backtest*.py' \) \
+            | head -n 1)
+
           if [ -z "$FILE" ]; then
-            echo "Script file nahi mili:"; ls -la; exit 1
+            echo "ERROR: pivot_backtest.py nahi mili."
+            echo ""
+            echo "Available files:"
+            ls -lah
+            exit 1
           fi
+
           echo "Using script: $FILE"
+
+          echo ""
+          echo "=========================================="
+          echo "Starting backtest"
+          echo "=========================================="
+
           python "$FILE" \
             --pair "${{ github.event.inputs.pair }}" \
             --days "${{ github.event.inputs.days }}" \
             --price "${{ github.event.inputs.price_type }}" \
-            --lev "${{ github.event.inputs.leverage || '10' }}" \
-            --margin "${{ github.event.inputs.margin || '1000' }}" \
-            --sl "${{ github.event.inputs.stop_loss || '0' }}" \
+            --lev "${{ github.event.inputs.leverage }}" \
+            --margin "${{ github.event.inputs.margin }}" \
+            --sl "${{ github.event.inputs.stop_loss }}" \
             --first "${{ github.event.inputs.first_exchange }}" \
-            --length "${{ github.event.inputs.length || '50' }}"
+            --length "${{ github.event.inputs.length }}"
+
+          echo ""
+          echo "=========================================="
+          echo "Checking output files"
+          echo "=========================================="
+
+          if [ ! -f "backtest_summary.csv" ]; then
+            echo "ERROR: backtest_summary.csv create nahi hui."
+            exit 1
+          fi
+
+          if [ ! -f "backtest_all_trades.csv" ]; then
+            echo "ERROR: backtest_all_trades.csv create nahi hui."
+            exit 1
+          fi
+
+          if [ ! -f "equity_all.png" ]; then
+            echo "ERROR: equity_all.png create nahi hui."
+            exit 1
+          fi
+
+          echo ""
+          echo "All output files successfully created:"
+          ls -lh \
+            backtest_summary.csv \
+            backtest_all_trades.csv \
+            equity_all.png
+
+
+      # ==================================================
+      # UPLOAD RESULTS
+      # ==================================================
 
       - name: Upload results
         uses: actions/upload-artifact@v4
-        if: always()
         with:
           name: backtest-results
           path: |
             backtest_summary.csv
             backtest_all_trades.csv
             equity_all.png
-          if-no-files-found: warn
+          if-no-files-found: error
