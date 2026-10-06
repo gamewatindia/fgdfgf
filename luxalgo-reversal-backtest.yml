@@ -1,0 +1,52 @@
+name: Shark LuxAlgo Reversal Backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      pair:
+        description: "Shark USDT Pair"
+        required: true
+        default: "BTCUSDT"
+      days:
+        description: "Historical days"
+        required: true
+        default: "30"
+      price_type:
+        description: "Candle price type"
+        required: true
+        type: choice
+        options:
+          - LAST_PRICE
+          - MARK_PRICE
+        default: LAST_PRICE
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install pandas requests
+
+      - name: Download Shark 5m candles
+        run: |
+          python download_shark_klines.py             --pair "${{ inputs.pair }}"             --interval 5m             --days "${{ inputs.days }}"             --price-type "${{ inputs.price_type }}"             --output "data/${{ inputs.pair }}_5m.csv"
+
+      - name: Run backtest
+        run: |
+          python luxalgo_backtest.py             --data "data/${{ inputs.pair }}_5m.csv"             --symbol "${{ inputs.pair }}"             --out results
+
+      - name: Show summary
+        run: cat results/summary.csv
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: luxalgo-reversal-${{ inputs.pair }}
+          path: results/

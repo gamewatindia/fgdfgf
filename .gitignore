@@ -1,5 +1,5 @@
 __pycache__/
 *.pyc
-results/
-.venv/
 .env
+results/
+data/*.csv
