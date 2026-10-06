@@ -1,3 +1,4 @@
+
 import os
 import time
 import argparse
@@ -5,13 +6,7 @@ import requests
 import pandas as pd
 from datetime import datetime, timezone, timedelta
 
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
 API_URL = "https://api.sharkexchange.in/v1/market/klines"
-
 INTERVAL = "5m"
 PIVOT_LENGTH = 50
 LIMIT = 1000
@@ -23,1785 +18,911 @@ NOTIONAL = MARGIN * LEVERAGE
 FEE_RATE = 0.00040
 GST_ON_FEE = 0.18
 SLIPPAGE = 0.00020
-
 TOUCH_TOLERANCE = 0.0015
 
 RESULTS_DIR = "results"
 
-
-# ============================================================
-# UTILITY
-# ============================================================
 
 def utc_now():
     return datetime.now(timezone.utc)
 
 
 def ms_to_datetime(ms):
-    return datetime.fromtimestamp(
-        ms / 1000,
-        tz=timezone.utc
-    )
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
 
-
-# ============================================================
-# SHARK EXCHANGE DOWNLOAD
-# ============================================================
 
 def download_history(pair, days, price_type="LAST_PRICE"):
-
     print("\n" + "=" * 80)
     print("SHARK EXCHANGE HISTORICAL DOWNLOAD")
     print("=" * 80)
 
     now = utc_now()
-
     requested_start = now - timedelta(days=days)
-
     current_end_ms = int(now.timestamp() * 1000)
-    requested_start_ms = int(
-        requested_start.timestamp() * 1000
-    )
+    requested_start_ms = int(requested_start.timestamp() * 1000)
 
     all_candles = []
-
     page = 1
 
     while True:
-
-        end_dt = ms_to_datetime(current_end_ms)
-
-        print(
-            f"\nDownloading page {page} "
-            f"(through: {end_dt})"
-        )
-
-        params = {
-            "priceType": price_type
-        }
-
-        payload = {
-            "pair": pair,
-            "interval": INTERVAL,
-            "endTime": current_end_ms,
-            "limit": LIMIT
-        }
+        print(f"\nDownloading page {page} (through: {ms_to_datetime(current_end_ms)})")
 
         try:
-
             response = requests.post(
                 API_URL,
-                params=params,
-                json=payload,
-                timeout=30
+                params={"priceType": price_type},
+                json={
+                    "pair": pair,
+                    "interval": INTERVAL,
+                    "endTime": current_end_ms,
+                    "limit": LIMIT,
+                },
+                timeout=30,
             )
-
         except Exception as e:
+            raise RuntimeError(f"Shark API connection failed: {e}")
 
-            raise RuntimeError(
-                f"Shark API connection failed: {e}"
-            )
-
-        print(
-            "HTTP STATUS:",
-            response.status_code
-        )
+        print("HTTP STATUS:", response.status_code)
 
         if response.status_code not in (200, 201):
-
             print("\nAPI RESPONSE:")
             print(response.text[:3000])
-
-            raise RuntimeError(
-                f"Shark API returned HTTP "
-                f"{response.status_code}"
-            )
+            raise RuntimeError(f"Shark API returned HTTP {response.status_code}")
 
         try:
-
             raw = response.json()
-
         except Exception:
-
-            print("\nCould not decode JSON.")
+            print("\nRAW RESPONSE:")
             print(response.text[:3000])
-
-            raise RuntimeError(
-                "Shark API response was not valid JSON."
-            )
-
-        # --------------------------------------------------------
-        # FIND CANDLE ARRAY
-        # --------------------------------------------------------
+            raise RuntimeError("Shark API response was not valid JSON.")
 
         candles = None
-
         if isinstance(raw, list):
-
             candles = raw
-
         elif isinstance(raw, dict):
-
-            possible_keys = [
-                "data",
-                "result",
-                "rows",
-                "candles",
-                "klines"
-            ]
-
-            for key in possible_keys:
-
+            for key in ("data", "result", "rows", "candles", "klines"):
                 value = raw.get(key)
-
                 if isinstance(value, list):
-
                     candles = value
                     break
-
                 if isinstance(value, dict):
-
-                    for subkey in [
-                        "data",
-                        "rows",
-                        "candles",
-                        "klines",
-                        "result"
-                    ]:
-
-                        subvalue = value.get(
-                            subkey
-                        )
-
-                        if isinstance(
-                            subvalue,
-                            list
-                        ):
-
+                    for subkey in ("data", "rows", "candles", "klines", "result"):
+                        subvalue = value.get(subkey)
+                        if isinstance(subvalue, list):
                             candles = subvalue
                             break
-
                     if candles is not None:
                         break
 
         if candles is None:
+            print("\nUNEXPECTED SHARK RESPONSE:")
+            print(str(raw)[:5000])
+            raise RuntimeError("Historical data could not be parsed.")
 
-            print(
-                "\nUNEXPECTED SHARK RESPONSE:"
-            )
-
-            print(
-                str(raw)[:5000]
-            )
-
-            raise RuntimeError(
-                "Historical data could not be parsed."
-            )
-
-        if len(candles) == 0:
-
-            print(
-                "No more candles returned."
-            )
-
+        if not candles:
+            print("No more candles returned.")
             break
 
-        # --------------------------------------------------------
-        # NORMALIZE
-        # --------------------------------------------------------
-
         normalized = []
-
         for candle in candles:
-
             if not isinstance(candle, dict):
                 continue
-
             try:
-
-                start_time = candle.get(
-                    "startTime"
-                )
-
+                start_time = candle.get("startTime")
                 if start_time is None:
                     continue
 
-                if isinstance(
-                    start_time,
-                    str
-                ):
-
+                if isinstance(start_time, str):
                     stripped = start_time.strip()
-
-                    if (
-                        stripped
-                        .replace(".", "", 1)
-                        .isdigit()
-                    ):
-
-                        start_time = int(
-                            float(stripped)
-                        )
-
+                    if stripped.replace(".", "", 1).isdigit():
+                        start_time = int(float(stripped))
                     else:
-
-                        dt = pd.to_datetime(
-                            stripped,
-                            utc=True,
-                            errors="coerce"
-                        )
-
+                        dt = pd.to_datetime(stripped, utc=True, errors="coerce")
                         if pd.isna(dt):
                             continue
-
-                        start_time = int(
-                            dt.timestamp() * 1000
-                        )
-
-                elif isinstance(
-                    start_time,
-                    (int, float)
-                ):
-
-                    start_time = int(
-                        start_time
-                    )
-
+                        start_time = int(dt.timestamp() * 1000)
+                elif isinstance(start_time, (int, float)):
+                    start_time = int(start_time)
                     if start_time < 10_000_000_000:
                         start_time *= 1000
-
                 else:
-
                     continue
 
                 normalized.append({
-
                     "timestamp": start_time,
-
-                    "open": float(
-                        candle["open"]
-                    ),
-
-                    "high": float(
-                        candle["high"]
-                    ),
-
-                    "low": float(
-                        candle["low"]
-                    ),
-
-                    "close": float(
-                        candle["close"]
-                    ),
-
-                    "volume": float(
-                        candle.get(
-                            "volume",
-                            0
-                        ) or 0
-                    )
+                    "open": float(candle["open"]),
+                    "high": float(candle["high"]),
+                    "low": float(candle["low"]),
+                    "close": float(candle["close"]),
+                    "volume": float(candle.get("volume", 0) or 0),
                 })
-
-            except Exception as e:
-
-                print(
-                    "Skipped malformed candle:",
-                    str(candle)[:500],
-                    "| Error:",
-                    e
-                )
+            except Exception:
+                continue
 
         if not normalized:
+            print("\nFirst API item:")
+            print(str(candles[0])[:2000])
+            raise RuntimeError("API returned candles but none could be normalized.")
 
-            print(
-                "\nFirst API item:"
-            )
+        print(f"Page {page}: {len(normalized)} valid candles")
+        all_candles.extend(normalized)
 
-            print(
-                str(candles[0])[:2000]
-            )
-
-            raise RuntimeError(
-                "API returned candles but none "
-                "could be normalized."
-            )
-
-        print(
-            f"Page {page}: "
-            f"{len(normalized)} valid candles"
-        )
-
-        all_candles.extend(
-            normalized
-        )
-
-        # --------------------------------------------------------
-        # PAGINATION
-        # --------------------------------------------------------
-
-        oldest_ms = min(
-            c["timestamp"]
-            for c in normalized
-        )
-
-        oldest_dt = ms_to_datetime(
-            oldest_ms
-        )
-
-        print(
-            "Oldest candle:",
-            oldest_dt
-        )
+        oldest_ms = min(c["timestamp"] for c in normalized)
+        print("Oldest candle:", ms_to_datetime(oldest_ms))
 
         if oldest_ms <= requested_start_ms:
-
-            print(
-                "\nRequested historical "
-                "period reached."
-            )
-
+            print("\nRequested historical period reached.")
             break
 
         next_end_ms = oldest_ms - 1
-
         if next_end_ms >= current_end_ms:
-
-            raise RuntimeError(
-                "Pagination stopped moving backwards."
-            )
+            raise RuntimeError("Pagination stopped moving backwards.")
 
         current_end_ms = next_end_ms
-
         page += 1
-
         time.sleep(0.30)
 
         if page > 500:
-
-            raise RuntimeError(
-                "Pagination safety limit reached."
-            )
-
-    # ------------------------------------------------------------
-    # DATAFRAME
-    # ------------------------------------------------------------
+            raise RuntimeError("Pagination safety limit reached.")
 
     if not all_candles:
+        raise RuntimeError("No historical candles downloaded.")
 
-        raise RuntimeError(
-            "No historical candles downloaded."
-        )
+    df = pd.DataFrame(all_candles)
+    df = df.drop_duplicates(subset=["timestamp"], keep="last")
+    df = df.sort_values("timestamp")
+    df = df[df["timestamp"] >= requested_start_ms].copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
 
-    df = pd.DataFrame(
-        all_candles
-    )
-
-    df = df.drop_duplicates(
-        subset=["timestamp"],
-        keep="last"
-    )
-
-    df = df.sort_values(
-        "timestamp"
-    )
-
-    df = df[
-        df["timestamp"]
-        >= requested_start_ms
-    ].copy()
-
-    df["timestamp"] = pd.to_datetime(
-        df["timestamp"],
-        unit="ms",
-        utc=True
-    )
-
-    # ------------------------------------------------------------
-    # REMOVE CURRENT OPEN CANDLE
-    # ------------------------------------------------------------
-
-    current_5m_start = pd.Timestamp.now(
-        tz="UTC"
-    ).floor("5min")
-
-    df = df[
-        df["timestamp"]
-        < current_5m_start
-    ].copy()
-
-    df.reset_index(
-        drop=True,
-        inplace=True
-    )
+    current_5m_start = pd.Timestamp.now(tz="UTC").floor("5min")
+    df = df[df["timestamp"] < current_5m_start].copy()
+    df.reset_index(drop=True, inplace=True)
 
     print("\n" + "=" * 80)
     print("DOWNLOAD COMPLETE")
     print("=" * 80)
-
-    print(
-        "Candles :",
-        len(df)
-    )
-
+    print("Candles :", len(df))
     if len(df):
-
-        print(
-            "From    :",
-            df["timestamp"].iloc[0]
-        )
-
-        print(
-            "To      :",
-            df["timestamp"].iloc[-1]
-        )
+        print("From    :", df["timestamp"].iloc[0])
+        print("To      :", df["timestamp"].iloc[-1])
 
     expected = days * 24 * 12
-
-    print(
-        "Expected approx :",
-        expected
-    )
-
-    coverage = (
-        len(df) / expected * 100
-        if expected
-        else 0
-    )
-
-    print(
-        f"Coverage        : "
-        f"{coverage:.2f}%"
-    )
+    coverage = len(df) / expected * 100 if expected else 0
+    print("Expected approx :", expected)
+    print(f"Coverage        : {coverage:.2f}%")
 
     if len(df) < 200:
-
-        raise RuntimeError(
-            f"Not enough candles downloaded: "
-            f"{len(df)}"
-        )
+        raise RuntimeError(f"Not enough candles downloaded: {len(df)}")
 
     return df
 
 
-# ============================================================
-# PIVOT FUNCTIONS
-# ============================================================
+def build_luxalgo_events(df, length=PIVOT_LENGTH):
+    """
+    Reproduces the open-source LuxAlgo Pivot Points High Low &
+    Missed Reversal Levels state machine as a causal event stream.
 
-def is_confirmed_pivot_high(
-    highs,
-    index,
-    length
-):
+    Critical distinction:
+      - pivot/ghost LABEL location = n-length
+      - event APPEARANCE time = n (the confirmation/current bar)
 
-    pivot_index = index - length
+    We use appearance time for backtesting, so no future-confirmed
+    pivot is available before it actually confirms.
+    """
+    n_rows = len(df)
+    highs = df["high"].astype(float).to_numpy()
+    lows = df["low"].astype(float).to_numpy()
 
-    if pivot_index < length:
-        return False
+    # Confirmed pivot values become available on the confirmation bar.
+    ph_at = [None] * n_rows
+    pl_at = [None] * n_rows
 
-    if pivot_index + length >= len(highs):
-        return False
+    for n in range(n_rows):
+        p = n - length
+        if p < length or p + length >= n_rows:
+            continue
 
-    value = highs[pivot_index]
+        window_h = highs[p - length:p + length + 1]
+        window_l = lows[p - length:p + length + 1]
 
-    left = highs[
-        pivot_index - length:
-        pivot_index
-    ]
+        if highs[p] >= window_h.max():
+            ph_at[n] = float(highs[p])
 
-    right = highs[
-        pivot_index + 1:
-        pivot_index + length + 1
-    ]
+        if lows[p] <= window_l.min():
+            pl_at[n] = float(lows[p])
 
-    return (
-        value >= max(left)
-        and
-        value >= max(right)
-    )
+    # Pine vars.
+    max_v = 0.0
+    min_v = 0.0
+    follow_max = 0.0
+    follow_min = 0.0
 
+    max_x1 = 0
+    min_x1 = 0
+    follow_max_x1 = 0
+    follow_min_x1 = 0
 
-def is_confirmed_pivot_low(
-    lows,
-    index,
-    length
-):
-
-    pivot_index = index - length
-
-    if pivot_index < length:
-        return False
-
-    if pivot_index + length >= len(lows):
-        return False
-
-    value = lows[pivot_index]
-
-    left = lows[
-        pivot_index - length:
-        pivot_index
-    ]
-
-    right = lows[
-        pivot_index + 1:
-        pivot_index + length + 1
-    ]
-
-    return (
-        value <= min(left)
-        and
-        value <= min(right)
-    )
-
-
-# ============================================================
-# BUILD CONFIRMED PIVOTS
-# ============================================================
-
-def build_confirmed_pivots(
-    df,
-    length=PIVOT_LENGTH
-):
-
-    highs = df["high"].values
-    lows = df["low"].values
-
-    pivot_high = [None] * len(df)
-    pivot_low = [None] * len(df)
-
-    for i in range(len(df)):
-
-        if is_confirmed_pivot_high(
-            highs,
-            i,
-            length
-        ):
-
-            pivot_index = i - length
-
-            pivot_high[pivot_index] = (
-                float(
-                    highs[pivot_index]
-                )
-            )
-
-        if is_confirmed_pivot_low(
-            lows,
-            i,
-            length
-        ):
-
-            pivot_index = i - length
-
-            pivot_low[pivot_index] = (
-                float(
-                    lows[pivot_index]
-                )
-            )
-
-    df = df.copy()
-
-    df["pivot_high"] = pivot_high
-    df["pivot_low"] = pivot_low
-
-    return df
-
-
-# ============================================================
-# DYNAMIC REVERSAL EVENTS
-#
-# This is a historical, non-lookahead approximation of the
-# LuxAlgo-style missed reversal / ghost structure.
-# ============================================================
-
-def build_dynamic_reversals(
-    df
-):
-
-    highs = df["high"].values
-    lows = df["low"].values
-
+    os = 0
     events = []
 
-    last_pivot_high = None
-    last_pivot_low = None
+    for n in range(n_rows):
+        p = n - length
 
-    ghost_low = None
-    ghost_high = None
+        # Pine: max := max(high[length], max), etc.
+        if p >= 0:
+            prev_max = max_v
+            prev_min = min_v
+            prev_follow_max = follow_max
+            prev_follow_min = follow_min
 
-    ghost_low_active = False
-    ghost_high_active = False
+            max_v = max(highs[p], max_v)
+            min_v = min(lows[p], min_v)
+            follow_max = max(highs[p], follow_max)
+            follow_min = min(lows[p], follow_min)
 
-    for i in range(len(df)):
+            if max_v > prev_max:
+                max_x1 = p
+                follow_min = lows[p]
 
-        candle_high = float(
-            highs[i]
-        )
+            if min_v < prev_min:
+                min_x1 = p
+                follow_max = highs[p]
 
-        candle_low = float(
-            lows[i]
-        )
+            if follow_min < prev_follow_min:
+                follow_min_x1 = p
 
-        candle_close = float(
-            df["close"].iloc[i]
-        )
+            if follow_max > prev_follow_max:
+                follow_max_x1 = p
 
-        # --------------------------------------------------------
-        # CONFIRMED REGULAR PIVOTS
-        # --------------------------------------------------------
+        ph = ph_at[n]
+        pl = pl_at[n]
 
-        ph = df[
-            "pivot_high"
-        ].iloc[i]
+        # Important: os[1] means previous state.
+        prev_os = os
 
-        pl = df[
-            "pivot_low"
-        ].iloc[i]
+        if ph is not None:
+            # Missed reversal branch from the original script.
+            if prev_os == 1:
+                events.append({
+                    "appearance_index": n,
+                    "location_index": min_x1,
+                    "type": "missed_low",
+                    "price": float(min_v),
+                })
 
-        if pd.notna(ph):
-
-            last_pivot_high = float(ph)
+            elif ph < max_v:
+                events.append({
+                    "appearance_index": n,
+                    "location_index": max_x1,
+                    "type": "missed_high",
+                    "price": float(max_v),
+                })
+                events.append({
+                    "appearance_index": n,
+                    "location_index": follow_min_x1,
+                    "type": "missed_low",
+                    "price": float(follow_min),
+                })
 
             events.append({
-
-                "index": i,
-
+                "appearance_index": n,
+                "location_index": p,
                 "type": "regular_high",
-
-                "price": float(ph)
-
+                "price": float(ph),
             })
 
-        if pd.notna(pl):
+            # Pine reset after PH.
+            os = 1
+            max_v = float(ph)
+            min_v = float(ph)
 
-            last_pivot_low = float(pl)
+        if pl is not None:
+            if prev_os == 0:
+                events.append({
+                    "appearance_index": n,
+                    "location_index": max_x1,
+                    "type": "missed_high",
+                    "price": float(max_v),
+                })
+
+            elif pl > min_v:
+                events.append({
+                    "appearance_index": n,
+                    "location_index": follow_max_x1,
+                    "type": "missed_high",
+                    "price": float(follow_max),
+                })
+                events.append({
+                    "appearance_index": n,
+                    "location_index": min_x1,
+                    "type": "missed_low",
+                    "price": float(min_v),
+                })
 
             events.append({
-
-                "index": i,
-
+                "appearance_index": n,
+                "location_index": p,
                 "type": "regular_low",
-
-                "price": float(pl)
-
+                "price": float(pl),
             })
 
-        # --------------------------------------------------------
-        # MISSED / DYNAMIC LOW
-        #
-        # Price breaks above previous pivot high.
-        # The current low becomes a candidate reversal point.
-        # --------------------------------------------------------
+            # Pine reset after PL.
+            os = 0
+            max_v = float(pl)
+            min_v = float(pl)
 
-        if (
-            last_pivot_high is not None
-            and candle_close > last_pivot_high
-        ):
-
-            if not ghost_low_active:
-
-                ghost_low = candle_low
-
-                ghost_low_active = True
-
-                events.append({
-
-                    "index": i,
-
-                    "type": "dynamic_low",
-
-                    "price": ghost_low
-
-                })
-
-            else:
-
-                if candle_low < ghost_low:
-
-                    ghost_low = candle_low
-
-                    events.append({
-
-                        "index": i,
-
-                        "type": "dynamic_low_shift",
-
-                        "price": ghost_low
-
-                    })
-
-        # --------------------------------------------------------
-        # MISSED / DYNAMIC HIGH
-        #
-        # Price breaks below previous pivot low.
-        # Current high becomes candidate reversal point.
-        # --------------------------------------------------------
-
-        if (
-            last_pivot_low is not None
-            and candle_close < last_pivot_low
-        ):
-
-            if not ghost_high_active:
-
-                ghost_high = candle_high
-
-                ghost_high_active = True
-
-                events.append({
-
-                    "index": i,
-
-                    "type": "dynamic_high",
-
-                    "price": ghost_high
-
-                })
-
-            else:
-
-                if candle_high > ghost_high:
-
-                    ghost_high = candle_high
-
-                    events.append({
-
-                        "index": i,
-
-                        "type": "dynamic_high_shift",
-
-                        "price": ghost_high
-
-                    })
-
-        # --------------------------------------------------------
-        # RESET DYNAMIC STRUCTURE WHEN OPPOSITE PIVOT APPEARS
-        # --------------------------------------------------------
-
-        if pd.notna(ph):
-
-            ghost_high = None
-            ghost_high_active = False
-
-        if pd.notna(pl):
-
-            ghost_low = None
-            ghost_low_active = False
-
+    events.sort(key=lambda e: (e["appearance_index"], e["type"]))
     return events
 
 
-# ============================================================
-# FIRST DYNAMIC TARGET
-# ============================================================
+def level_touched(high, low, level, tolerance=TOUCH_TOLERANCE):
+    upper = level * (1 + tolerance)
+    lower = level * (1 - tolerance)
+    return low <= upper and high >= lower
 
-def first_dynamic_target_after_entry(
-    events,
-    entry_index,
-    entry_price,
-    side
-):
-
-    candidates = []
-
-    for event in events:
-
-        event_index = event["index"]
-
-        if event_index < entry_index:
-            continue
-
-        event_type = event["type"]
-
-        price = float(
-            event["price"]
-        )
-
-        # --------------------------------------------------------
-        # LONG
-        #
-        # Target must be ABOVE entry.
-        # Prefer dynamic reversal events.
-        # --------------------------------------------------------
-
-        if side == "LONG":
-
-            if (
-                "dynamic" in event_type
-                and price > entry_price
-            ):
-
-                candidates.append(
-                    event
-                )
-
-                break
-
-        # --------------------------------------------------------
-        # SHORT
-        #
-        # Target must be BELOW entry.
-        # --------------------------------------------------------
-
-        elif side == "SHORT":
-
-            if (
-                "dynamic" in event_type
-                and price < entry_price
-            ):
-
-                candidates.append(
-                    event
-                )
-
-                break
-
-    if not candidates:
-        return None
-
-    return candidates[0]
-
-
-# ============================================================
-# TOUCH CHECK
-# ============================================================
-
-def level_touched(
-    candle_high,
-    candle_low,
-    level,
-    tolerance=TOUCH_TOLERANCE
-):
-
-    upper = level * (
-        1 + tolerance
-    )
-
-    lower = level * (
-        1 - tolerance
-    )
-
-    return (
-        candle_low <= upper
-        and
-        candle_high >= lower
-    )
-
-
-# ============================================================
-# CANDLE CONFIRMATION
-# ============================================================
 
 def bullish_candle(row):
-
-    return (
-        float(row["close"])
-        > float(row["open"])
-    )
+    return float(row["close"]) > float(row["open"])
 
 
 def bearish_candle(row):
-
-    return (
-        float(row["close"])
-        < float(row["open"])
-    )
+    return float(row["close"]) < float(row["open"])
 
 
-# ============================================================
-# TRADE COST
-# ============================================================
-
-def calculate_fee(
-    price,
-    notional=NOTIONAL
-):
-
-    gross_fee = (
-        notional * FEE_RATE
-    )
-
-    gst = (
-        gross_fee * GST_ON_FEE
-    )
-
-    return gross_fee + gst
+def calculate_fee(notional=NOTIONAL):
+    fee = notional * FEE_RATE
+    return fee + fee * GST_ON_FEE
 
 
-# ============================================================
-# ENTRY / EXIT PRICE WITH SLIPPAGE
-# ============================================================
+def apply_entry_slippage(price, side):
+    return price * (1 + SLIPPAGE) if side == "LONG" else price * (1 - SLIPPAGE)
 
-def apply_entry_slippage(
-    price,
-    side
-):
 
+def apply_exit_slippage(price, side):
+    return price * (1 - SLIPPAGE) if side == "LONG" else price * (1 + SLIPPAGE)
+
+
+def calculate_gross_pnl(side, entry_price, exit_price):
+    quantity = NOTIONAL / entry_price
     if side == "LONG":
-
-        return price * (
-            1 + SLIPPAGE
-        )
-
-    return price * (
-        1 - SLIPPAGE
-    )
+        return (exit_price - entry_price) * quantity
+    return (entry_price - exit_price) * quantity
 
 
-def apply_exit_slippage(
-    price,
-    side
-):
-
-    if side == "LONG":
-
-        return price * (
-            1 - SLIPPAGE
-        )
-
-    return price * (
-        1 + SLIPPAGE
-    )
-
-
-# ============================================================
-# PNL
-# ============================================================
-
-def calculate_gross_pnl(
-    side,
-    entry_price,
-    exit_price
-):
-
-    quantity = (
-        NOTIONAL / entry_price
-    )
-
-    if side == "LONG":
-
-        return (
-            exit_price
-            - entry_price
-        ) * quantity
-
-    return (
-        entry_price
-        - exit_price
-    ) * quantity
-
-
-# ============================================================
-# FIND ENTRY SETUPS
-#
-# We use already-known dynamic reversal levels.
-# Entry is triggered only after confirmation candle breakout.
-# ============================================================
-
-def find_setup(
-    df,
-    events,
-    current_index
-):
-
-    if current_index < 2:
+def find_setup(df, events, i):
+    """
+    Signal uses reversal levels that had already APPEARED before
+    the signal candle. We never use an event that appears later.
+    """
+    if i < 1:
         return None
 
-    current = df.iloc[
-        current_index
+    row = df.iloc[i]
+
+    recent = [
+        e for e in events
+        if i - 10 <= e["appearance_index"] <= i
+        and e["appearance_index"] <= i
     ]
 
-    previous = df.iloc[
-        current_index - 1
+    # Long: a missed/dynamic low is support.
+    low_events = [
+        e for e in recent
+        if e["type"] == "missed_low"
+        and e["price"] <= float(row["high"])
     ]
 
-    # --------------------------------------------------------
-    # Search recent dynamic events.
-    # --------------------------------------------------------
+    if low_events and bullish_candle(row):
+        e = low_events[-1]
+        level = float(e["price"])
 
-    recent_events = [
-        e
-        for e in events
-        if (
-            current_index - 10
-            <= e["index"]
-            <= current_index
-        )
+        if level_touched(
+            float(row["high"]),
+            float(row["low"]),
+            level
+        ):
+            return {
+                "side": "LONG",
+                "signal_index": i,
+                "level": level,
+                "confirmation_high": float(row["high"]),
+                "stop_loss": float(row["low"]),
+            }
+
+    # Short: a missed/dynamic high is resistance.
+    high_events = [
+        e for e in recent
+        if e["type"] == "missed_high"
+        and e["price"] >= float(row["low"])
     ]
 
-    if not recent_events:
-        return None
+    if high_events and bearish_candle(row):
+        e = high_events[-1]
+        level = float(e["price"])
 
-    # --------------------------------------------------------
-    # LONG SETUP
-    #
-    # Price touches dynamic low and forms bullish candle.
-    # Entry is next candle breaking confirmation high.
-    # --------------------------------------------------------
-
-    bullish_levels = [
-        e
-        for e in recent_events
-        if (
-            "dynamic_low" in e["type"]
-            and e["price"] <= current["high"]
-        )
-    ]
-
-    if bullish_levels:
-
-        level_event = bullish_levels[-1]
-
-        level = float(
-            level_event["price"]
-        )
-
-        if level <= current["high"]:
-
-            if level_touched(
-                current["high"],
-                current["low"],
-                level
-            ):
-
-                if bullish_candle(
-                    current
-                ):
-
-                    return {
-
-                        "side": "LONG",
-
-                        "signal_index":
-                            current_index,
-
-                        "level":
-                            level,
-
-                        "confirmation_high":
-                            float(
-                                current["high"]
-                            ),
-
-                        "stop_loss":
-                            float(
-                                current["low"]
-                            )
-                    }
-
-    # --------------------------------------------------------
-    # SHORT SETUP
-    # --------------------------------------------------------
-
-    bearish_levels = [
-        e
-        for e in recent_events
-        if (
-            "dynamic_high" in e["type"]
-            and e["price"] >= current["low"]
-        )
-    ]
-
-    if bearish_levels:
-
-        level_event = bearish_levels[-1]
-
-        level = float(
-            level_event["price"]
-        )
-
-        if level >= current["low"]:
-
-            if level_touched(
-                current["high"],
-                current["low"],
-                level
-            ):
-
-                if bearish_candle(
-                    current
-                ):
-
-                    return {
-
-                        "side": "SHORT",
-
-                        "signal_index":
-                            current_index,
-
-                        "level":
-                            level,
-
-                        "confirmation_low":
-                            float(
-                                current["low"]
-                            ),
-
-                        "stop_loss":
-                            float(
-                                current["high"]
-                            )
-                    }
+        if level_touched(
+            float(row["high"]),
+            float(row["low"]),
+            level
+        ):
+            return {
+                "side": "SHORT",
+                "signal_index": i,
+                "level": level,
+                "confirmation_low": float(row["low"]),
+                "stop_loss": float(row["high"]),
+            }
 
     return None
 
 
-# ============================================================
-# BACKTEST
-# ============================================================
+def first_dynamic_target_after_entry(events, entry_index, entry_price, side):
+    """
+    Return the FIRST missed reversal that APPEARS after entry.
 
-def backtest(
+    The appearance_index is the candle on which the reversal becomes
+    known to the historical observer. The plotted location_index can
+    be earlier; that historical location is NOT used as availability
+    time.
+    """
+    for event in events:
+        appearance = int(event["appearance_index"])
+
+        if appearance < entry_index:
+            continue
+
+        if not event["type"].startswith("missed_"):
+            continue
+
+        price = float(event["price"])
+
+        if side == "LONG" and price > entry_price:
+            return event
+
+        if side == "SHORT" and price < entry_price:
+            return event
+
+    return None
+
+
+def simulate_trade(
     df,
-    events
+    events,
+    setup,
+    entry_index
 ):
+    side = setup["side"]
 
+    entry_candle = df.iloc[entry_index]
+
+    if side == "LONG":
+        trigger = setup["confirmation_high"]
+        if float(entry_candle["high"]) <= trigger:
+            return None
+    else:
+        trigger = setup["confirmation_low"]
+        if float(entry_candle["low"]) >= trigger:
+            return None
+
+    entry_price = apply_entry_slippage(
+        float(trigger),
+        side
+    )
+    stop_loss = float(setup["stop_loss"])
+
+    # Find the first reversal appearance AFTER entry.
+    target_event = first_dynamic_target_after_entry(
+        events,
+        entry_index,
+        entry_price,
+        side
+    )
+
+    target_created_index = (
+        int(target_event["appearance_index"])
+        if target_event is not None
+        else None
+    )
+
+    target = (
+        float(target_event["price"])
+        if target_event is not None
+        else None
+    )
+
+    target_created_time = (
+        df["timestamp"].iloc[target_created_index]
+        if target_created_index is not None
+        else pd.NaT
+    )
+
+    # ------------------------------------------------------------
+    # CRITICAL CHRONOLOGY:
+    #
+    # Before target appears, ONLY SL is active.
+    # On the candle where target appears, we do NOT count a target
+    # hit from that candle's earlier intrabar movement, because the
+    # reversal becomes known at the close/confirmation of that bar.
+    # Target checking starts on the NEXT candle.
+    # ------------------------------------------------------------
+
+    exit_index = None
+    exit_price = None
+    exit_reason = None
+
+    # First manage candles from entry through the candle immediately
+    # before target appearance.
+    pre_target_end = (
+        target_created_index
+        if target_created_index is not None
+        else len(df)
+    )
+
+    for j in range(entry_index, pre_target_end):
+        row = df.iloc[j]
+        high = float(row["high"])
+        low = float(row["low"])
+
+        if side == "LONG":
+            if low <= stop_loss:
+                exit_index = j
+                exit_price = stop_loss
+                exit_reason = "SL"
+                break
+        else:
+            if high >= stop_loss:
+                exit_index = j
+                exit_price = stop_loss
+                exit_reason = "SL"
+                break
+
+    if exit_index is None and target_created_index is None:
+        # No target appeared before dataset end.
+        exit_index = len(df) - 1
+        exit_price = float(df["close"].iloc[exit_index])
+        exit_reason = "END_OF_DATA_NO_TARGET"
+
+    if exit_index is None and target_created_index is not None:
+        # Target is now locked. It is immutable from this point.
+        print(
+            f"TARGET LOCKED | {side} | "
+            f"entry={entry_price:.10g} | "
+            f"target={target:.10g} | "
+            f"appeared={target_created_time}"
+        )
+
+        # Target can only be hit AFTER the candle on which it appeared.
+        for j in range(target_created_index + 1, len(df)):
+            row = df.iloc[j]
+            high = float(row["high"])
+            low = float(row["low"])
+
+            if side == "LONG":
+                sl_hit = low <= stop_loss
+                target_hit = high >= target
+
+                if sl_hit:
+                    exit_index = j
+                    exit_price = stop_loss
+                    exit_reason = "SL"
+                    break
+
+                if target_hit:
+                    exit_index = j
+                    exit_price = target
+                    exit_reason = "TARGET"
+                    break
+
+            else:
+                sl_hit = high >= stop_loss
+                target_hit = low <= target
+
+                if sl_hit:
+                    exit_index = j
+                    exit_price = stop_loss
+                    exit_reason = "SL"
+                    break
+
+                if target_hit:
+                    exit_index = j
+                    exit_price = target
+                    exit_reason = "TARGET"
+                    break
+
+    if exit_index is None:
+        exit_index = len(df) - 1
+        exit_price = float(df["close"].iloc[exit_index])
+        exit_reason = "END_OF_DATA"
+
+    exit_price_slip = apply_exit_slippage(
+        exit_price,
+        side
+    )
+
+    gross_pnl = calculate_gross_pnl(
+        side,
+        entry_price,
+        exit_price_slip
+    )
+
+    total_fee = (
+        calculate_fee()
+        + calculate_fee()
+    )
+
+    net_pnl = gross_pnl - total_fee
+
+    risk = abs(
+        entry_price - stop_loss
+    ) * (NOTIONAL / entry_price)
+
+    reward = (
+        abs(target - entry_price) * (NOTIONAL / entry_price)
+        if target is not None
+        else 0.0
+    )
+
+    rr = reward / risk if risk > 0 else 0.0
+
+    result = (
+        "WIN"
+        if exit_reason == "TARGET"
+        else "LOSS"
+        if exit_reason == "SL"
+        else "OPEN"
+    )
+
+    return {
+        "side": side,
+        "entry_index": entry_index,
+        "entry_time": df["timestamp"].iloc[entry_index],
+        "entry_price": entry_price,
+        "stop_loss": stop_loss,
+        "target": target,
+        "target_created_index": target_created_index,
+        "target_created_time": target_created_time,
+        "exit_index": exit_index,
+        "exit_time": df["timestamp"].iloc[exit_index],
+        "exit_price": exit_price_slip,
+        "exit_reason": exit_reason,
+        "result": result,
+        "gross_pnl": gross_pnl,
+        "fees": total_fee,
+        "net_pnl": net_pnl,
+        "risk": risk,
+        "reward": reward,
+        "rr": rr,
+    }
+
+
+def backtest(df, events):
     trades = []
-
     i = 0
 
     while i < len(df) - 2:
-
-        setup = find_setup(
-            df,
-            events,
-            i
-        )
+        setup = find_setup(df, events, i)
 
         if setup is None:
-
             i += 1
             continue
 
-        side = setup["side"]
-
-        # ----------------------------------------------------
-        # Entry trigger = next candle breakout
-        # ----------------------------------------------------
-
         entry_index = i + 1
-
-        entry_candle = df.iloc[
+        trade = simulate_trade(
+            df,
+            events,
+            setup,
             entry_index
-        ]
-
-        if side == "LONG":
-
-            trigger = float(
-                setup["confirmation_high"]
-            )
-
-            if float(
-                entry_candle["high"]
-            ) <= trigger:
-
-                i += 1
-                continue
-
-            raw_entry = trigger
-
-        else:
-
-            trigger = float(
-                setup["confirmation_low"]
-            )
-
-            if float(
-                entry_candle["low"]
-            ) >= trigger:
-
-                i += 1
-                continue
-
-            raw_entry = trigger
-
-        entry_price = apply_entry_slippage(
-            raw_entry,
-            side
         )
 
-        stop_loss = float(
-            setup["stop_loss"]
-        )
-
-        # ----------------------------------------------------
-        # FIRST DYNAMIC REVERSAL AFTER ENTRY
-        #
-        # Once found, target is LOCKED permanently.
-        # ----------------------------------------------------
-
-        target_event = (
-            first_dynamic_target_after_entry(
-                events,
-                entry_index,
-                entry_price,
-                side
-            )
-        )
-
-        if target_event is None:
-
-            # No target available.
-            # Do not manufacture one.
-            i = entry_index + 1
+        if trade is None:
+            i += 1
             continue
 
-        target_price = float(
-            target_event["price"]
-        )
-
-        target_created_index = int(
-            target_event["index"]
-        )
-
-        target_created_time = (
-            df["timestamp"].iloc[
-                target_created_index
-            ]
-        )
-
-        # ----------------------------------------------------
-        # IMPORTANT:
-        #
-        # TARGET IS NOW LOCKED.
-        #
-        # We NEVER update target_price after this point.
-        # ----------------------------------------------------
-
-        locked_target = target_price
-
-        print(
-            "\nTARGET LOCKED:",
-            side,
-            "| Entry:",
-            entry_price,
-            "| Target:",
-            locked_target,
-            "| Created:",
-            target_created_time
-        )
-
-        exit_index = None
-        exit_price = None
-        exit_reason = None
-
-        # ----------------------------------------------------
-        # TRADE MANAGEMENT
-        # ----------------------------------------------------
-
-        j = entry_index
-
-        while j < len(df):
-
-            candle = df.iloc[j]
-
-            high = float(
-                candle["high"]
-            )
-
-            low = float(
-                candle["low"]
-            )
-
-            # ------------------------------------------------
-            # LONG
-            # ------------------------------------------------
-
-            if side == "LONG":
-
-                sl_hit = (
-                    low <= stop_loss
+        # Hard chronology validation.
+        if trade["target_created_time"] is not pd.NaT and pd.notna(
+            trade["target_created_time"]
+        ):
+            if trade["target_created_time"] < trade["entry_time"]:
+                raise RuntimeError(
+                    "INVALID TRADE: target appeared before entry."
                 )
 
-                target_hit = (
-                    high >= locked_target
+            if (
+                trade["exit_reason"] == "TARGET"
+                and trade["exit_time"] < trade["target_created_time"]
+            ):
+                raise RuntimeError(
+                    "INVALID TRADE: target hit before target appeared."
                 )
 
-                # Conservative rule:
-                # If both occur on same candle,
-                # assume SL happened first.
-                if sl_hit:
+        trade["trade_no"] = len(trades) + 1
+        trades.append(trade)
 
-                    exit_index = j
-                    exit_price = stop_loss
-                    exit_reason = "SL"
-                    break
+        # One position at a time.
+        i = trade["exit_index"] + 1
 
-                if target_hit:
-
-                    exit_index = j
-                    exit_price = locked_target
-                    exit_reason = "TARGET"
-                    break
-
-            # ------------------------------------------------
-            # SHORT
-            # ------------------------------------------------
-
-            else:
-
-                sl_hit = (
-                    high >= stop_loss
-                )
-
-                target_hit = (
-                    low <= locked_target
-                )
-
-                if sl_hit:
-
-                    exit_index = j
-                    exit_price = stop_loss
-                    exit_reason = "SL"
-                    break
-
-                if target_hit:
-
-                    exit_index = j
-                    exit_price = locked_target
-                    exit_reason = "TARGET"
-                    break
-
-            j += 1
-
-        # ----------------------------------------------------
-        # If still open at dataset end
-        # ----------------------------------------------------
-
-        if exit_index is None:
-
-            exit_index = len(df) - 1
-
-            exit_price = float(
-                df["close"].iloc[
-                    exit_index
-                ]
-            )
-
-            exit_reason = "END_OF_DATA"
-
-        exit_price_after_slippage = (
-            apply_exit_slippage(
-                exit_price,
-                side
-            )
-        )
-
-        gross_pnl = calculate_gross_pnl(
-            side,
-            entry_price,
-            exit_price_after_slippage
-        )
-
-        entry_fee = calculate_fee(
-            entry_price
-        )
-
-        exit_fee = calculate_fee(
-            exit_price_after_slippage
-        )
-
-        total_fee = (
-            entry_fee
-            + exit_fee
-        )
-
-        net_pnl = (
-            gross_pnl
-            - total_fee
-        )
-
-        risk_per_trade = abs(
-            entry_price
-            - stop_loss
-        ) * (
-            NOTIONAL / entry_price
-        )
-
-        reward_per_trade = abs(
-            locked_target
-            - entry_price
-        ) * (
-            NOTIONAL / entry_price
-        )
-
-        rr = (
-            reward_per_trade
-            / risk_per_trade
-            if risk_per_trade > 0
-            else 0
-        )
-
-        result = (
-            "WIN"
-            if exit_reason == "TARGET"
-            else
-            "LOSS"
-            if exit_reason == "SL"
-            else
-            "OPEN"
-        )
-
-        trade = {
-
-            "trade_no":
-                len(trades) + 1,
-
-            "side":
-                side,
-
-            "signal_time":
-                df["timestamp"].iloc[i],
-
-            "entry_time":
-                df["timestamp"].iloc[
-                    entry_index
-                ],
-
-            "entry_price":
-                entry_price,
-
-            "stop_loss":
-                stop_loss,
-
-            "target":
-                locked_target,
-
-            "target_created_time":
-                target_created_time,
-
-            "target_created_index":
-                target_created_index,
-
-            "exit_time":
-                df["timestamp"].iloc[
-                    exit_index
-                ],
-
-            "exit_price":
-                exit_price_after_slippage,
-
-            "exit_reason":
-                exit_reason,
-
-            "result":
-                result,
-
-            "gross_pnl":
-                gross_pnl,
-
-            "fees":
-                total_fee,
-
-            "net_pnl":
-                net_pnl,
-
-            "risk":
-                risk_per_trade,
-
-            "reward":
-                reward_per_trade,
-
-            "rr":
-                rr
-        }
-
-        trades.append(
-            trade
-        )
-
-        # ----------------------------------------------------
-        # Do not immediately enter another trade while
-        # previous trade is active.
-        # ----------------------------------------------------
-
-        i = exit_index + 1
-
-    return pd.DataFrame(
-        trades
-    )
+    return pd.DataFrame(trades)
 
 
-# ============================================================
-# SUMMARY
-# ============================================================
-
-def make_summary(
-    trades,
-    pair,
-    days
-):
-
+def make_summary(trades, pair, days):
     if trades.empty:
-
         return pd.DataFrame([{
-
             "pair": pair,
             "days": days,
             "trades": 0,
             "wins": 0,
             "losses": 0,
-            "win_rate": 0,
-            "gross_pnl": 0,
-            "fees": 0,
-            "net_pnl": 0,
-            "profit_factor": 0,
-            "average_rr": 0,
-            "max_drawdown": 0
-
+            "win_rate": 0.0,
+            "gross_pnl": 0.0,
+            "fees": 0.0,
+            "net_pnl": 0.0,
+            "profit_factor": 0.0,
+            "average_rr": 0.0,
+            "max_drawdown": 0.0,
         }])
 
-    wins = int(
-        (
-            trades["result"]
-            == "WIN"
-        ).sum()
-    )
+    wins = int((trades["result"] == "WIN").sum())
+    losses = int((trades["result"] == "LOSS").sum())
+    total = len(trades)
 
-    losses = int(
-        (
-            trades["result"]
-            == "LOSS"
-        ).sum()
-    )
+    win_rate = wins / total * 100
 
-    total_trades = len(
-        trades
-    )
-
-    win_rate = (
-        wins
-        / total_trades
-        * 100
-    )
-
-    gross_pnl = float(
-        trades["gross_pnl"].sum()
-    )
-
-    fees = float(
-        trades["fees"].sum()
-    )
-
-    net_pnl = float(
-        trades["net_pnl"].sum()
-    )
+    gross_pnl = float(trades["gross_pnl"].sum())
+    fees = float(trades["fees"].sum())
+    net_pnl = float(trades["net_pnl"].sum())
 
     winning_profit = float(
-        trades.loc[
-            trades["net_pnl"] > 0,
-            "net_pnl"
-        ].sum()
+        trades.loc[trades["net_pnl"] > 0, "net_pnl"].sum()
+    )
+    losing_profit = abs(float(
+        trades.loc[trades["net_pnl"] < 0, "net_pnl"].sum()
+    ))
+
+    profit_factor = (
+        winning_profit / losing_profit
+        if losing_profit > 0
+        else 0.0
     )
 
-    losing_profit = abs(
-        float(
-            trades.loc[
-                trades["net_pnl"] < 0,
-                "net_pnl"
-            ].sum()
-        )
-    )
+    average_rr = float(trades["rr"].mean())
 
-    if losing_profit > 0:
+    cumulative = trades["net_pnl"].cumsum()
+    running_max = cumulative.cummax()
+    drawdown = running_max - cumulative
+    max_drawdown = float(drawdown.max())
 
-        profit_factor = (
-            winning_profit
-            / losing_profit
-        )
-
-    else:
-
-        profit_factor = 0
-
-    average_rr = float(
-        trades["rr"].mean()
-    )
-
-    cumulative = (
-        trades["net_pnl"]
-        .cumsum()
-    )
-
-    running_max = (
-        cumulative.cummax()
-    )
-
-    drawdown = (
-        running_max
-        - cumulative
-    )
-
-    max_drawdown = float(
-        drawdown.max()
+    no_target = int(
+        (trades["target"].isna()).sum()
     )
 
     return pd.DataFrame([{
-
-        "pair":
-            pair,
-
-        "days":
-            days,
-
-        "trades":
-            total_trades,
-
-        "wins":
-            wins,
-
-        "losses":
-            losses,
-
-        "win_rate":
-            win_rate,
-
-        "gross_pnl":
-            gross_pnl,
-
-        "fees":
-            fees,
-
-        "net_pnl":
-            net_pnl,
-
-        "profit_factor":
-            profit_factor,
-
-        "average_rr":
-            average_rr,
-
-        "max_drawdown":
-            max_drawdown
-
+        "pair": pair,
+        "days": days,
+        "trades": total,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": win_rate,
+        "gross_pnl": gross_pnl,
+        "fees": fees,
+        "net_pnl": net_pnl,
+        "profit_factor": profit_factor,
+        "average_rr": average_rr,
+        "max_drawdown": max_drawdown,
+        "trades_without_target": no_target,
     }])
 
 
-# ============================================================
-# PRINT RESULTS
-# ============================================================
+def validate_trades(trades):
+    if trades.empty:
+        return
 
-def print_results(
-    trades,
-    summary
-):
+    invalid_target_time = trades[
+        trades["target_created_time"].notna()
+        & (
+            trades["target_created_time"]
+            < trades["entry_time"]
+        )
+    ]
 
+    invalid_target_exit = trades[
+        (trades["exit_reason"] == "TARGET")
+        & (
+            trades["exit_time"]
+            < trades["target_created_time"]
+        )
+    ]
+
+    if len(invalid_target_time):
+        raise RuntimeError(
+            f"Validation failed: {len(invalid_target_time)} "
+            "trades have target before entry."
+        )
+
+    if len(invalid_target_exit):
+        raise RuntimeError(
+            f"Validation failed: {len(invalid_target_exit)} "
+            "trades hit target before target appearance."
+        )
+
+    print("\nCHRONOLOGY VALIDATION: PASSED")
+    print(
+        "Every target appears at/after entry, and every TARGET exit "
+        "occurs after target appearance."
+    )
+
+
+def print_results(trades, summary):
     print("\n" + "=" * 80)
     print("LUXALGO FIRST DYNAMIC REVERSAL BACKTEST")
     print("=" * 80)
 
     row = summary.iloc[0]
 
-    print(
-        f"Trades        : "
-        f"{int(row['trades'])}"
-    )
-
-    print(
-        f"Wins          : "
-        f"{int(row['wins'])}"
-    )
-
-    print(
-        f"Losses        : "
-        f"{int(row['losses'])}"
-    )
-
-    print(
-        f"Win Rate      : "
-        f"{row['win_rate']:.2f}%"
-    )
-
-    print(
-        f"Gross P&L     : "
-        f"₹{row['gross_pnl']:.2f}"
-    )
-
-    print(
-        f"Fees + Slippage: "
-        f"₹{row['fees']:.2f}"
-    )
-
-    print(
-        f"Net P&L       : "
-        f"₹{row['net_pnl']:.2f}"
-    )
-
-    print(
-        f"Profit Factor : "
-        f"{row['profit_factor']:.3f}"
-    )
-
-    print(
-        f"Average RR    : "
-        f"{row['average_rr']:.3f}"
-    )
-
-    print(
-        f"Max Drawdown  : "
-        f"₹{row['max_drawdown']:.2f}"
-    )
+    for label, key, fmt in [
+        ("Trades", "trades", "int"),
+        ("Wins", "wins", "int"),
+        ("Losses", "losses", "int"),
+        ("Win Rate", "win_rate", "pct"),
+        ("Gross P&L", "gross_pnl", "money"),
+        ("Fees", "fees", "money"),
+        ("Net P&L", "net_pnl", "money"),
+        ("Profit Factor", "profit_factor", "float"),
+        ("Average RR", "average_rr", "float"),
+        ("Max Drawdown", "max_drawdown", "money"),
+    ]:
+        value = row[key]
+        if fmt == "int":
+            print(f"{label:15}: {int(value)}")
+        elif fmt == "pct":
+            print(f"{label:15}: {value:.2f}%")
+        elif fmt == "money":
+            print(f"{label:15}: ₹{value:.2f}")
+        else:
+            print(f"{label:15}: {value:.3f}")
 
     print("\n" + "-" * 80)
 
-    if not trades.empty:
+    if trades.empty:
+        print("No trades found.")
+        return
 
-        display_columns = [
+    cols = [
+        "trade_no",
+        "side",
+        "entry_time",
+        "entry_price",
+        "stop_loss",
+        "target",
+        "target_created_time",
+        "exit_time",
+        "exit_price",
+        "exit_reason",
+        "result",
+        "net_pnl",
+        "rr",
+    ]
 
-            "trade_no",
-            "side",
-            "entry_time",
-            "entry_price",
-            "stop_loss",
-            "target",
-            "target_created_time",
-            "exit_time",
-            "exit_price",
-            "exit_reason",
-            "result",
-            "net_pnl",
-            "rr"
-
-        ]
-
-        print(
-            trades[
-                display_columns
-            ].to_string(
-                index=False
-            )
-        )
-
-    else:
-
-        print(
-            "No trades found."
-        )
+    print(
+        trades[cols].to_string(index=False)
+    )
 
     print("=" * 80)
 
 
-# ============================================================
-# SAVE RESULTS
-# ============================================================
-
-def save_results(
-    trades,
-    summary,
-    pair
-):
-
-    os.makedirs(
-        RESULTS_DIR,
-        exist_ok=True
-    )
+def save_results(trades, summary, events, pair):
+    os.makedirs(RESULTS_DIR, exist_ok=True)
 
     trades_file = os.path.join(
         RESULTS_DIR,
         f"{pair}_trades.csv"
     )
-
     summary_file = os.path.join(
         RESULTS_DIR,
         "summary.csv"
+    )
+    events_file = os.path.join(
+        RESULTS_DIR,
+        f"{pair}_luxalgo_events.csv"
     )
 
     trades.to_csv(
@@ -1814,36 +935,26 @@ def save_results(
         index=False
     )
 
-    print(
-        "\nResults saved:"
-    )
+    events_df = pd.DataFrame(events)
 
-    print(
-        trades_file
-    )
+    if not events_df.empty:
+        events_df.to_csv(
+            events_file,
+            index=False
+        )
 
-    print(
-        summary_file
-    )
+    print("\nResults saved:")
+    print(trades_file)
+    print(summary_file)
+    print(events_file)
 
-
-# ============================================================
-# MAIN
-# ============================================================
 
 def main():
-
-    parser = argparse.ArgumentParser(
-        description=(
-            "LuxAlgo-style First Dynamic "
-            "Reversal Backtest"
-        )
-    )
+    parser = argparse.ArgumentParser()
 
     parser.add_argument(
         "--pair",
-        required=True,
-        type=str
+        required=True
     )
 
     parser.add_argument(
@@ -1863,138 +974,56 @@ def main():
 
     args = parser.parse_args()
 
-    print("\n")
+    print("\n" + "=" * 80)
+    print("LUXALGO FIRST DYNAMIC REVERSAL BACKTEST")
     print("=" * 80)
-    print(
-        "LUXALGO FIRST DYNAMIC "
-        "REVERSAL BACKTEST"
-    )
-    print("=" * 80)
-
-    print(
-        f"Pair        : {args.pair}"
-    )
-
-    print(
-        f"Days        : {args.days}"
-    )
-
-    print(
-        f"Timeframe   : {INTERVAL}"
-    )
-
-    print(
-        f"Price Type  : {args.price_type}"
-    )
-
-    print(
-        f"Pivot Length: {PIVOT_LENGTH}"
-    )
-
-    print(
-        f"Margin      : ₹{MARGIN}"
-    )
-
-    print(
-        f"Leverage    : {LEVERAGE}x"
-    )
-
-    print(
-        f"Notional    : ₹{NOTIONAL}"
-    )
-
-    print(
-        "Target      : FIRST DYNAMIC "
-        "REVERSAL — LOCKED"
-    )
-
-    # --------------------------------------------------------
-    # DOWNLOAD
-    # --------------------------------------------------------
+    print("Pair        :", args.pair)
+    print("Days        :", args.days)
+    print("Timeframe   :", INTERVAL)
+    print("Pivot       :", PIVOT_LENGTH)
+    print("Price type  :", args.price_type)
+    print("Margin      :", f"₹{MARGIN:.2f}")
+    print("Leverage    :", f"{LEVERAGE:.1f}x")
+    print("Notional    :", f"₹{NOTIONAL:.2f}")
+    print("Target      :", "FIRST MISSED REVERSAL AFTER ENTRY — LOCKED")
 
     df = download_history(
-        pair=args.pair,
-        days=args.days,
-        price_type=args.price_type
+        args.pair,
+        args.days,
+        args.price_type
     )
 
-    # --------------------------------------------------------
-    # PIVOTS
-    # --------------------------------------------------------
+    print("\nBuilding causal LuxAlgo events...")
 
-    print("\nBuilding confirmed pivots...")
-
-    df = build_confirmed_pivots(
+    events = build_luxalgo_events(
         df,
         PIVOT_LENGTH
     )
 
-    pivot_high_count = int(
-        df["pivot_high"]
-        .notna()
-        .sum()
-    )
-
-    pivot_low_count = int(
-        df["pivot_low"]
-        .notna()
-        .sum()
-    )
-
-    print(
-        "Confirmed Pivot Highs:",
-        pivot_high_count
-    )
-
-    print(
-        "Confirmed Pivot Lows :",
-        pivot_low_count
-    )
-
-    # --------------------------------------------------------
-    # DYNAMIC REVERSALS
-    # --------------------------------------------------------
-
-    print(
-        "\nBuilding dynamic reversal events..."
-    )
-
-    events = build_dynamic_reversals(
-        df
-    )
-
-    dynamic_events = [
-        e
-        for e in events
-        if "dynamic" in e["type"]
+    missed = [
+        e for e in events
+        if e["type"].startswith("missed_")
     ]
 
-    print(
-        "Total structural events:",
-        len(events)
-    )
+    regular = [
+        e for e in events
+        if e["type"].startswith("regular_")
+    ]
 
-    print(
-        "Dynamic reversal events:",
-        len(dynamic_events)
-    )
+    print("Total events       :", len(events))
+    print("Regular pivots     :", len(regular))
+    print("Missed reversals   :", len(missed))
 
-    # --------------------------------------------------------
-    # BACKTEST
-    # --------------------------------------------------------
-
-    print(
-        "\nRunning backtest..."
-    )
+    print("\nRunning backtest...")
 
     trades = backtest(
         df,
         events
     )
 
-    # --------------------------------------------------------
-    # SUMMARY
-    # --------------------------------------------------------
+    validate_trades(
+        trades
+    )
 
     summary = make_summary(
         trades,
@@ -2007,24 +1036,15 @@ def main():
         summary
     )
 
-    # --------------------------------------------------------
-    # SAVE
-    # --------------------------------------------------------
-
     save_results(
         trades,
         summary,
+        events,
         args.pair
     )
 
-    print(
-        "\nBACKTEST COMPLETE."
-    )
+    print("\nBACKTEST COMPLETE.")
 
-
-# ============================================================
-# PROGRAM ENTRY POINT
-# ============================================================
 
 if __name__ == "__main__":
     main()
