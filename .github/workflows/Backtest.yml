@@ -3,25 +3,39 @@ name: Pivot Backtest
 on:
   workflow_dispatch:
     inputs:
-      symbol:
-        description: "Symbol (ccxt format)"
-        default: "BTC/USDT"
-      length:
-        description: "Pivot length"
-        default: "50"
+      pair:
+        description: "USDT Pair (e.g. BTCUSDT)"
+        required: true
+        default: "BTCUSDT"
       days:
-        description: "Backtest days"
+        description: "Historical days"
+        required: true
         default: "30"
-  schedule:
-    - cron: "30 2 * * *"
+      price_type:
+        description: "Candle price type"
+        required: true
+        type: choice
+        default: "LAST_PRICE"
+        options:
+          - LAST_PRICE
+          - MARK_PRICE
+          - INDEX_PRICE
+      leverage:
+        description: "Leverage (x)"
+        required: false
+        default: "10"
+      margin:
+        description: "Margin per trade (Rs)"
+        required: false
+        default: "1000"
+      length:
+        description: "Pivot length (optional)"
+        required: false
+        default: "50"
 
 jobs:
   backtest:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        tf: ["5m", "15m", "30m", "1h", "4h"]
     steps:
       - uses: actions/checkout@v4
 
@@ -32,29 +46,29 @@ jobs:
       - name: Install dependencies
         run: pip install pandas numpy ccxt matplotlib
 
-      - name: Run backtest (${{ matrix.tf }})
+      - name: Run backtest (all 5 timeframes)
         shell: bash
         run: |
           FILE=$(find . -maxdepth 1 -type f -iname 'pivot*backtest*' | head -n 1)
           if [ -z "$FILE" ]; then
-            echo "Script file nahi mili. Repo ke root me files:"
-            ls -la
-            exit 1
+            echo "Script file nahi mili:"; ls -la; exit 1
           fi
           echo "Using script: $FILE"
           python "$FILE" \
-            --exchange binanceus \
-            --symbol "${{ github.event.inputs.symbol || 'BTC/USDT' }}" \
-            --tf ${{ matrix.tf }} \
-            --length ${{ github.event.inputs.length || '50' }} \
-            --days ${{ github.event.inputs.days || '30' }}
+            --pair "${{ github.event.inputs.pair }}" \
+            --days "${{ github.event.inputs.days }}" \
+            --price "${{ github.event.inputs.price_type }}" \
+            --lev "${{ github.event.inputs.leverage || '10' }}" \
+            --margin "${{ github.event.inputs.margin || '1000' }}" \
+            --length "${{ github.event.inputs.length || '50' }}"
 
       - name: Upload results
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: backtest-${{ matrix.tf }}
+          name: backtest-results
           path: |
-            backtest_trades_*.csv
-            equity_curve_*.png
+            backtest_summary.csv
+            backtest_all_trades.csv
+            equity_all.png
           if-no-files-found: warn
