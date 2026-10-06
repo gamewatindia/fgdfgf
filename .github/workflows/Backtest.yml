@@ -28,6 +28,10 @@ on:
         description: "Margin per trade (Rs)"
         required: false
         default: "1000"
+      stop_loss:
+        description: "Stop-loss % of price (0 = off, e.g. 4 for 10x)"
+        required: false
+        default: "0"
       first_exchange:
         description: "Preferred exchange, tried first (optional, e.g. gateio)"
         required: false
@@ -64,6 +68,7 @@ jobs:
             --price "${{ github.event.inputs.price_type }}" \
             --lev "${{ github.event.inputs.leverage || '10' }}" \
             --margin "${{ github.event.inputs.margin || '1000' }}" \
+            --sl "${{ github.event.inputs.stop_loss || '0' }}" \
             --first "${{ github.event.inputs.first_exchange }}" \
             --length "${{ github.event.inputs.length || '50' }}"
 
