@@ -1,0 +1,38 @@
+name: LuxAlgo Pivot Backtest
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "data/**"
+      - "luxalgo_pivot_backtest.py"
+      - ".github/workflows/luxalgo-backtest.yml"
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install pandas
+
+      - name: Run backtest
+        run: |
+          python luxalgo_pivot_backtest.py \
+            --data data/BTCUSDT_5m.csv \
+            --symbol BTCUSDT \
+            --out results
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: luxalgo-backtest-results
+          path: results/
