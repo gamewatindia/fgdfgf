@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       pair:
-        description: "USDT Pair (e.g. BTCUSDT)"
+        description: "USDT Pair"
         required: true
         default: "BTCUSDT"
 
@@ -24,22 +24,22 @@ on:
           - INDEX_PRICE
 
       leverage:
-        description: "Leverage (x)"
+        description: "Leverage"
         required: false
         default: "10"
 
       margin:
-        description: "Margin per trade (Rs)"
+        description: "Margin per trade"
         required: false
         default: "1000"
 
       stop_loss:
-        description: "Stop-loss % of price (0 = off)"
+        description: "Stop loss % (0 = off)"
         required: false
         default: "0"
 
       first_exchange:
-        description: "Preferred exchange (optional, e.g. gateio)"
+        description: "Preferred exchange"
         required: false
         default: ""
 
@@ -56,7 +56,7 @@ jobs:
 
     steps:
 
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
 
@@ -72,45 +72,85 @@ jobs:
           pip install pandas numpy ccxt matplotlib
 
 
-      - name: Run pivot backtest
+      - name: Run backtest
+        env:
+          PAIR: ${{ inputs.pair }}
+          DAYS: ${{ inputs.days }}
+          PRICE: ${{ inputs.price }}
+          LEVERAGE: ${{ inputs.leverage }}
+          MARGIN: ${{ inputs.margin }}
+          STOP_LOSS: ${{ inputs.stop_loss }}
+          FIRST_EXCHANGE: ${{ inputs.first_exchange }}
+          LENGTH: ${{ inputs.length }}
+
         shell: bash
         run: |
 
           set -e
 
-          echo "=========================================="
+          echo "========================================"
           echo "Repository files"
-          echo "=========================================="
+          echo "========================================"
 
           ls -lah
 
           echo ""
-          echo "=========================================="
-          echo "Checking pivot_backtest"
-          echo "=========================================="
+          echo "========================================"
+          echo "Checking Python file"
+          echo "========================================"
 
           FILE="./pivot_backtest"
 
           if [ ! -f "$FILE" ]; then
             echo "ERROR: pivot_backtest file nahi mili."
             echo ""
-            echo "Available files:"
             ls -lah
             exit 1
           fi
 
-          echo "Using script: $FILE"
+          echo "Using: $FILE"
 
           echo ""
-          echo "=========================================="
-          echo "Starting backtest"
-          echo "=========================================="
+          echo "========================================"
+          echo "Running backtest"
+          echo "========================================"
 
           python "$FILE" \
-            --pair "${{ github.event.inputs.pair }}" \
-            --days "${{ github.event.inputs.days }}" \
-            --price "${{ github.event.inputs.price }}" \
-            --lev "${{ github.event.inputs.leverage }}" \
-            --margin "${{ github.event.inputs.margin }}" \
-            --sl "${{ github.event.inputs.stop_loss }}" \
-            --first "${{ github.event
+            --pair "$PAIR" \
+            --days "$DAYS" \
+            --price "$PRICE" \
+            --lev "$LEVERAGE" \
+            --margin "$MARGIN" \
+            --sl "$STOP_LOSS" \
+            --first "$FIRST_EXCHANGE" \
+            --length "$LENGTH"
+
+          echo ""
+          echo "========================================"
+          echo "Checking results"
+          echo "========================================"
+
+          test -f backtest_summary.csv
+          test -f backtest_all_trades.csv
+          test -f equity_all.png
+
+          echo ""
+          echo "========================================"
+          echo "BACKTEST SUCCESS"
+          echo "========================================"
+
+          ls -lh \
+            backtest_summary.csv \
+            backtest_all_trades.csv \
+            equity_all.png
+
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-results
+          path: |
+            backtest_summary.csv
+            backtest_all_trades.csv
+            equity_all.png
+          if-no-files-found: error
