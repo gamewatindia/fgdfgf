@@ -1,74 +1,23 @@
-"""
-PIVOT HIGH/LOW LUXALGO-STYLE BACKTEST
-
-TIMEFRAMES:
-5m, 15m, 30m, 1h, 4h
-
-ENTRY:
-Confirmed Pivot LOW  -> LONG
-Confirmed Pivot HIGH -> SHORT
-
-ENTRY PRICE:
-Confirmation candle CLOSE
-
-INITIAL STOP LOSS:
-LONG  -> Confirmation candle LOW
-SHORT -> Confirmation candle HIGH
-
-POSITION:
-Margin    = Rs 1000
-Leverage  = 10x
-Notional  = Rs 10000
-
-TAKE PROFIT:
-75% position closes at +2% price movement.
-
-RUNNER:
-25% remains after TP.
-
-After 75% TP:
-Runner SL = Entry price (BREAKEVEN)
-
-Runner closes at:
-- Breakeven
-- Opposite pivot
-- Liquidation
-- End of data
-
-OUTPUT:
-backtest_all_trades.csv
-backtest_summary.csv
-equity_all.png
-"""
-
 import argparse
-import os
 import time
+import os
 import pandas as pd
+import numpy as np
 
 
 # =========================================================
 # CONFIG
 # =========================================================
 
-MARGIN = 1000.0
-LEV = 10.0
+MARGIN_DEFAULT = 1000.0
+LEV_DEFAULT = 10.0
 
 MMR = 0.005
-
-# Fee per side = 0.10%
 FEE_PCT = 0.10
 
-# 75% position TP
 TP_PCT = 2.0
-
 TP_PART = 0.75
 RUNNER_PART = 0.25
-
-
-# =========================================================
-# TIMEFRAMES
-# =========================================================
 
 TFS = [
     "5m",
@@ -120,28 +69,24 @@ EXCHANGES = {
 
 def norm_pair(pair):
 
-    pair = pair.upper().strip()
+    p = pair.upper()
 
-    pair = pair.replace("-", "/")
-    pair = pair.replace("_", "/")
+    p = p.replace("-", "/")
+    p = p.replace("_", "/")
 
-    if "/" not in pair:
+    if "/" not in p:
 
-        for quote in (
-            "USDT",
-            "USDC",
-            "USD"
-        ):
+        for q in ("USDT", "USDC", "USD"):
 
-            if pair.endswith(quote):
+            if p.endswith(q):
 
                 return (
-                    pair[:-len(quote)]
+                    p[:-len(q)]
                     + "/"
-                    + quote
+                    + q
                 )
 
-    return pair
+    return p
 
 
 # =========================================================
@@ -159,35 +104,30 @@ def fetch(
 
     import ccxt
 
+    order = (
+        [first]
+        if first
+        else []
+    )
+
+    order += [
+        x
+        for x in EXCHANGES[price]
+        if x != first
+    ]
+
     errors = []
 
-    order = []
-
-    if first:
-        order.append(first)
-
-    for exchange_name in EXCHANGES[price]:
-
-        if exchange_name not in order:
-
-            order.append(exchange_name)
-
-    for exchange_name in order:
+    for name in order:
 
         exchange = None
 
         try:
 
-            print(
-                f"[{tf}] Trying {exchange_name}..."
-            )
-
-            exchange_class = getattr(
+            exchange = getattr(
                 ccxt,
-                exchange_name
-            )
-
-            exchange = exchange_class({
+                name
+            )({
                 "enableRateLimit": True
             })
 
@@ -221,17 +161,7 @@ def fetch(
 
             if price == "LAST_PRICE":
 
-                if not exchange.has.get(
-                    "fetchOHLCV"
-                ):
-
-                    raise ValueError(
-                        "fetchOHLCV not supported"
-                    )
-
-                fetch_function = (
-                    exchange.fetch_ohlcv
-                )
+                fn = exchange.fetch_ohlcv
 
             elif price == "MARK_PRICE":
 
@@ -240,12 +170,10 @@ def fetch(
                 ):
 
                     raise ValueError(
-                        "mark OHLCV not supported"
+                        "mark OHLCV unsupported"
                     )
 
-                fetch_function = (
-                    exchange.fetch_mark_ohlcv
-                )
+                fn = exchange.fetch_mark_ohlcv
 
             else:
 
@@ -254,18 +182,16 @@ def fetch(
                 ):
 
                     raise ValueError(
-                        "index OHLCV not supported"
+                        "index OHLCV unsupported"
                     )
 
-                fetch_function = (
-                    exchange.fetch_index_ohlcv
-                )
+                fn = exchange.fetch_index_ohlcv
 
             # ---------------------------------------------
             # TIME
             # ---------------------------------------------
 
-            timeframe_ms = (
+            tf_ms = (
                 exchange.parse_timeframe(tf)
                 * 1000
             )
@@ -275,37 +201,33 @@ def fetch(
             since = (
                 now
                 - days * 86400000
-                - warmup * timeframe_ms
+                - warmup * tf_ms
             )
 
             rows = []
 
-            safety = 0
+            # ---------------------------------------------
+            # DOWNLOAD
+            # ---------------------------------------------
 
             while since < now:
 
-                safety += 1
-
-                if safety > 100:
-
-                    break
-
-                candles = fetch_function(
+                batch = fn(
                     symbol,
                     tf,
                     since=since,
                     limit=1000
                 )
 
-                if not candles:
+                if not batch:
 
                     break
 
-                rows.extend(candles)
+                rows.extend(batch)
 
                 next_since = (
-                    candles[-1][0]
-                    + timeframe_ms
+                    batch[-1][0]
+                    + tf_ms
                 )
 
                 if next_since <= since:
@@ -316,14 +238,14 @@ def fetch(
 
                 time.sleep(
                     max(
-                        exchange.rateLimit / 1000,
-                        0.05
-                    )
+                        exchange.rateLimit,
+                        50
+                    ) / 1000.0
                 )
 
             if len(rows) < max(
-                100,
-                warmup * 2
+                2 * warmup,
+                100
             ):
 
                 raise ValueError(
@@ -334,9 +256,10 @@ def fetch(
             # DATAFRAME
             # ---------------------------------------------
 
-            df = pd.DataFrame(
-                rows
-            ).iloc[:, :5]
+            df = (
+                pd.DataFrame(rows)
+                .iloc[:, :5]
+            )
 
             df.columns = [
                 "time",
@@ -351,35 +274,16 @@ def fetch(
                 unit="ms"
             )
 
-            for col in [
-                "open",
-                "high",
-                "low",
-                "close"
-            ]:
-
-                df[col] = pd.to_numeric(
-                    df[col],
-                    errors="coerce"
-                )
-
             df = (
                 df
-                .dropna()
-                .drop_duplicates(
-                    "time"
-                )
-                .sort_values(
-                    "time"
-                )
-                .reset_index(
-                    drop=True
-                )
+                .drop_duplicates("time")
+                .sort_values("time")
+                .reset_index(drop=True)
             )
 
             print(
                 f"[{tf}] data: "
-                f"{exchange_name} "
+                f"{name} "
                 f"{symbol} "
                 f"{price} "
                 f"({len(df)} candles)"
@@ -387,20 +291,14 @@ def fetch(
 
             return df
 
-        except Exception as error:
-
-            message = (
-                f"{exchange_name}: "
-                f"{str(error)[:150]}"
-            )
-
-            print(
-                f"[{tf}] {message}"
-            )
+        except Exception as e:
 
             errors.append(
-                message
+                f"{name}: "
+                f"{str(e)[:120]}"
             )
+
+        finally:
 
             try:
 
@@ -425,7 +323,9 @@ def backtest(
     df,
     length,
     days,
-    tf
+    tf,
+    margin,
+    lev
 ):
 
     high = df["high"].to_numpy(
@@ -444,41 +344,28 @@ def backtest(
 
     cutoff = (
         times.iloc[-1]
-        - pd.Timedelta(
-            days=days
-        )
+        - pd.Timedelta(days=days)
     )
 
     trades = []
 
-    pivots = 0
-
-    # -----------------------------------------------------
-    # POSITION
-    # -----------------------------------------------------
-
     position = 0
-
-    # 1 = LONG
-    # -1 = SHORT
 
     entry_price = None
     entry_time = None
 
-    # NEW:
-    # Entry candle based SL
-    entry_sl = None
+    sl_price = None
 
     trade_id = 0
 
     tp_hit = False
 
-    # -----------------------------------------------------
+    # =====================================================
     # POSITION SIZE
-    # -----------------------------------------------------
+    # =====================================================
 
     total_notional = (
-        MARGIN * LEV
+        margin * lev
     )
 
     tp_notional = (
@@ -491,29 +378,21 @@ def backtest(
         * RUNNER_PART
     )
 
-    # -----------------------------------------------------
-    # TP
-    # -----------------------------------------------------
-
-    tp_distance = (
-        TP_PCT / 100.0
-    )
-
-    # -----------------------------------------------------
+    # =====================================================
     # LIQUIDATION
-    # -----------------------------------------------------
+    # =====================================================
 
     liquidation_distance = max(
-        1.0 / LEV - MMR,
+        1.0 / lev - MMR,
         0.001
     )
 
 
     # =====================================================
-    # HELPER: SIDE
+    # HELPERS
     # =====================================================
 
-    def get_side():
+    def side():
 
         if position == 1:
 
@@ -521,10 +400,6 @@ def backtest(
 
         return "SHORT"
 
-
-    # =====================================================
-    # HELPER: PNL
-    # =====================================================
 
     def calculate_pnl(
         nominal,
@@ -552,10 +427,6 @@ def backtest(
         )
 
 
-    # =====================================================
-    # HELPER: FEES
-    # =====================================================
-
     def calculate_fee(
         nominal
     ):
@@ -567,10 +438,6 @@ def backtest(
             * 2.0
         )
 
-
-    # =====================================================
-    # RECORD TRADE
-    # =====================================================
 
     def record_trade(
         portion,
@@ -590,10 +457,10 @@ def backtest(
         )
 
         net = (
-            gross - fees
+            gross
+            - fees
         )
 
-        # Liquidation
         if status == "LIQUIDATED":
 
             net = -nominal
@@ -607,7 +474,7 @@ def backtest(
                 tf,
 
             "side":
-                get_side(),
+                side(),
 
             "entry_time":
                 entry_time,
@@ -620,11 +487,9 @@ def backtest(
 
             "entry_sl":
                 round(
-                    entry_sl,
+                    sl_price,
                     8
-                )
-                if entry_sl is not None
-                else None,
+                ),
 
             "exit_time":
                 exit_time,
@@ -661,17 +526,34 @@ def backtest(
         })
 
 
+    def reset_position():
+
+        nonlocal position
+        nonlocal entry_price
+        nonlocal entry_time
+        nonlocal sl_price
+        nonlocal tp_hit
+
+        position = 0
+
+        entry_price = None
+
+        entry_time = None
+
+        sl_price = None
+
+        tp_hit = False
+
+
     # =====================================================
     # MAIN LOOP
     # =====================================================
 
-    start_index = max(
-        2 * length,
-        length + 2
-    )
-
     for i in range(
-        start_index,
+        max(
+            2 * length,
+            length + 2
+        ),
         len(df)
     ):
 
@@ -682,10 +564,32 @@ def backtest(
         if position != 0:
 
             # =============================================
-            # 1. 75% TP
+            # BEFORE TP
             # =============================================
 
             if not tp_hit:
+
+                # -----------------------------------------
+                # ENTRY CANDLE SL
+                # -----------------------------------------
+
+                if position == 1:
+
+                    sl_hit = (
+                        low[i]
+                        <= sl_price
+                    )
+
+                else:
+
+                    sl_hit = (
+                        high[i]
+                        >= sl_price
+                    )
+
+                # -----------------------------------------
+                # TP PRICE
+                # -----------------------------------------
 
                 if position == 1:
 
@@ -693,7 +597,7 @@ def backtest(
                         entry_price
                         * (
                             1
-                            + tp_distance
+                            + TP_PCT / 100
                         )
                     )
 
@@ -708,7 +612,7 @@ def backtest(
                         entry_price
                         * (
                             1
-                            - tp_distance
+                            - TP_PCT / 100
                         )
                     )
 
@@ -716,6 +620,28 @@ def backtest(
                         low[i]
                         <= tp_price
                     )
+
+                # -----------------------------------------
+                # SL FIRST
+                # -----------------------------------------
+
+                if sl_hit:
+
+                    record_trade(
+                        "100%",
+                        sl_price,
+                        times.iloc[i],
+                        "ENTRY CANDLE SL",
+                        total_notional
+                    )
+
+                    reset_position()
+
+                    continue
+
+                # -----------------------------------------
+                # 75% TP
+                # -----------------------------------------
 
                 if tp_reached:
 
@@ -731,77 +657,7 @@ def backtest(
 
 
             # =============================================
-            # 2. ENTRY CANDLE SL
-            #
-            # LONG  -> entry candle LOW
-            # SHORT -> entry candle HIGH
-            #
-            # ONLY BEFORE TP
-            # =============================================
-
-            if (
-                position != 0
-                and not tp_hit
-                and entry_sl is not None
-            ):
-
-                if position == 1:
-
-                    # LONG:
-                    # candle low touches SL
-
-                    if low[i] <= entry_sl:
-
-                        record_trade(
-                            "100%",
-                            entry_sl,
-                            times.iloc[i],
-                            "ENTRY CANDLE SL",
-                            total_notional
-                        )
-
-                        position = 0
-
-                        entry_price = None
-
-                        entry_time = None
-
-                        entry_sl = None
-
-                        tp_hit = False
-
-                        continue
-
-                else:
-
-                    # SHORT:
-                    # candle high touches SL
-
-                    if high[i] >= entry_sl:
-
-                        record_trade(
-                            "100%",
-                            entry_sl,
-                            times.iloc[i],
-                            "ENTRY CANDLE SL",
-                            total_notional
-                        )
-
-                        position = 0
-
-                        entry_price = None
-
-                        entry_time = None
-
-                        entry_sl = None
-
-                        tp_hit = False
-
-                        continue
-
-
-            # =============================================
-            # 3. RUNNER BREAKEVEN
+            # RUNNER AFTER TP
             # =============================================
 
             if (
@@ -809,69 +665,72 @@ def backtest(
                 and tp_hit
             ):
 
+                # Runner SL = BREAKEVEN
+
                 if position == 1:
 
-                    if low[i] <= entry_price:
-
-                        record_trade(
-                            "25%",
-                            entry_price,
-                            times.iloc[i],
-                            "BREAKEVEN",
-                            runner_notional
-                        )
-
-                        position = 0
-
-                        entry_price = None
-
-                        entry_time = None
-
-                        entry_sl = None
-
-                        tp_hit = False
-
-                        continue
+                    breakeven_hit = (
+                        low[i]
+                        <= entry_price
+                    )
 
                 else:
 
-                    if high[i] >= entry_price:
+                    breakeven_hit = (
+                        high[i]
+                        >= entry_price
+                    )
 
-                        record_trade(
-                            "25%",
-                            entry_price,
-                            times.iloc[i],
-                            "BREAKEVEN",
-                            runner_notional
-                        )
+                if breakeven_hit:
 
-                        position = 0
+                    record_trade(
+                        "25%",
+                        entry_price,
+                        times.iloc[i],
+                        "BREAKEVEN",
+                        runner_notional
+                    )
 
-                        entry_price = None
+                    reset_position()
 
-                        entry_time = None
-
-                        entry_sl = None
-
-                        tp_hit = False
-
-                        continue
+                    continue
 
 
             # =============================================
-            # 4. LIQUIDATION
+            # LIQUIDATION
             # =============================================
 
             if position != 0:
 
                 if position == 1:
 
-                    adverse = (
-                        entry_price
-                        - low[i]
-                    ) / entry_price
+                    liquidation_hit = (
+                        low[i]
+                        <= (
+                            entry_price
+                            * (
+                                1
+                                - liquidation_distance
+                            )
+                        )
+                    )
 
-                    if adverse >= liquidation_distance:
+                else:
+
+                    liquidation_hit = (
+                        high[i]
+                        >= (
+                            entry_price
+                            * (
+                                1
+                                + liquidation_distance
+                            )
+                        )
+                    )
+
+                if liquidation_hit:
+
+                    if position == 1:
 
                         liquidation_price = (
                             entry_price
@@ -881,46 +740,7 @@ def backtest(
                             )
                         )
 
-                        if tp_hit:
-
-                            record_trade(
-                                "25%",
-                                liquidation_price,
-                                times.iloc[i],
-                                "LIQUIDATED",
-                                runner_notional
-                            )
-
-                        else:
-
-                            record_trade(
-                                "100%",
-                                liquidation_price,
-                                times.iloc[i],
-                                "LIQUIDATED",
-                                total_notional
-                            )
-
-                        position = 0
-
-                        entry_price = None
-
-                        entry_time = None
-
-                        entry_sl = None
-
-                        tp_hit = False
-
-                        continue
-
-                else:
-
-                    adverse = (
-                        high[i]
-                        - entry_price
-                    ) / entry_price
-
-                    if adverse >= liquidation_distance:
+                    else:
 
                         liquidation_price = (
                             entry_price
@@ -930,21 +750,84 @@ def backtest(
                             )
                         )
 
-                        if tp_hit:
+                    if tp_hit:
 
-                            record_trade(
-                                "25%",
-                                liquidation_price,
-                                times.iloc[i],
-                                "LIQUIDATED",
-                                runner_notional
-                            )
+                        record_trade(
+                            "25%",
+                            liquidation_price,
+                            times.iloc[i],
+                            "LIQUIDATED",
+                            runner_notional
+                        )
 
-                        else:
+                    else:
 
-                            record_trade(
-                                "100%",
-                                liquidation_price,
-                                times.iloc[i],
-                                "LIQUIDATED",
-                                total
+                        record_trade(
+                            "100%",
+                            liquidation_price,
+                            times.iloc[i],
+                            "LIQUIDATED",
+                            total_notional
+                        )
+
+                    reset_position()
+
+                    continue
+
+
+        # =================================================
+        # PIVOT DETECTION
+        # =================================================
+
+        pivot_index = (
+            i - length
+        )
+
+        window_high = high[
+            pivot_index - length:
+            i + 1
+        ]
+
+        window_low = low[
+            pivot_index - length:
+            i + 1
+        ]
+
+        pivot_high = (
+            high[pivot_index]
+            == window_high.max()
+            and
+            (
+                window_high
+                == high[pivot_index]
+            ).sum()
+            == 1
+        )
+
+        pivot_low = (
+            low[pivot_index]
+            == window_low.min()
+            and
+            (
+                window_low
+                == low[pivot_index]
+            ).sum()
+            == 1
+        )
+
+        if not (
+            pivot_high
+            or pivot_low
+        ):
+
+            continue
+
+        if (
+            times.iloc[i]
+            < cutoff
+        ):
+
+            continue
+
+        # =================================================
+        # D
