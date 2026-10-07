@@ -6,26 +6,33 @@ on:
   workflow_dispatch:
     inputs:
       coin:
-        description: 'Select Crypto Coin'
+        description: 'Select Coin'
         required: true
-        default: 'BTC'
+        default: 'SOL'
         type: choice
         options:
+          - SOL
           - BTC
           - ETH
-          - SOL
           - DOGE
-          - XRP
+      period:
+        description: 'Lookback Period'
+        required: true
+        default: '180d'
+        type: choice
+        options:
+          - '180d'
+          - '360d'
+          - '60d'
       timeframe:
-        description: 'Select Timeframe'
+        description: 'Timeframe'
         required: true
         default: '1h'
         type: choice
         options:
-          - '15m'
           - '1h'
+          - '15m'
           - '4h'
-          - '1d'
       trade_amount:
         description: 'Margin Per Trade (₹ INR)'
         required: true
@@ -33,35 +40,16 @@ on:
       leverage:
         description: 'Leverage Multiplier'
         required: true
-        default: '5'
+        default: '10'
         type: choice
         options:
-          - '1'
-          - '2'
-          - '3'
-          - '5'
           - '10'
-      direction:
-        description: 'Trade Direction'
-        required: true
-        default: 'both'
-        type: choice
-        options:
-          - 'both'
-          - 'long_only'
-          - 'short_only'
-      strategy_type:
-        description: 'Strategy Logic (Breakout recommended)'
-        required: true
-        default: 'breakout'
-        type: choice
-        options:
-          - 'breakout'
-          - 'reversal'
+          - '7'
+          - '5'
       pivot_length:
-        description: 'Pivot Length'
+        description: 'Fast Pivot Detection (3 recommended)'
         required: true
-        default: '15'
+        default: '3'
 
 jobs:
   backtest:
@@ -83,20 +71,19 @@ jobs:
 
       - name: Run Backtester
         run: |
-          export COIN="${{ github.event.inputs.coin || 'BTC' }}"
+          export COIN="${{ github.event.inputs.coin || 'SOL' }}"
+          export PERIOD="${{ github.event.inputs.period || '180d' }}"
           export TIMEFRAME="${{ github.event.inputs.timeframe || '1h' }}"
           export TRADE_AMOUNT="${{ github.event.inputs.trade_amount || '1000' }}"
-          export LEVERAGE="${{ github.event.inputs.leverage || '5' }}"
-          export DIRECTION="${{ github.event.inputs.direction || 'both' }}"
-          export STRATEGY_TYPE="${{ github.event.inputs.strategy_type || 'breakout' }}"
-          export PIVOT_LENGTH="${{ github.event.inputs.pivot_length || '15' }}"
+          export LEVERAGE="${{ github.event.inputs.leverage || '10' }}"
+          export PIVOT_LENGTH="${{ github.event.inputs.pivot_length || '3' }}"
 
           python backtest_pivots.py | tee output.log
 
       - name: Show Results in GitHub Summary
         if: always()
         run: |
-          echo "## 🚀 Improved Backtest Summary (₹ INR)" >> $GITHUB_STEP_SUMMARY
+          echo "## 🚀 High Profit Backtest Summary (₹ INR)" >> $GITHUB_STEP_SUMMARY
           echo '```text' >> $GITHUB_STEP_SUMMARY
           cat output.log >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
