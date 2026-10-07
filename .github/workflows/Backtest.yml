@@ -1,81 +1,105 @@
-name: Run Pivot Points Backtest
+name: Crypto Pivot Backtest (INR & Leverage)
 
-# Controls when the workflow will run
 on:
   push:
     branches: [ "main", "master" ]
-  pull_request:
-    branches: [ "main", "master" ]
-  # Allows you to manually trigger the backtest from the GitHub Actions tab
   workflow_dispatch:
     inputs:
-      pivot_length:
-        description: 'Pivot Length (Bars to Confirm)'
+      coin:
+        description: 'Select Crypto Coin'
         required: true
-        default: '15'
+        default: 'BTC'
+        type: choice
+        options:
+          - BTC
+          - ETH
+          - SOL
+          - DOGE
+          - XRP
+          - ADA
+      timeframe:
+        description: 'Select Timeframe'
+        required: true
+        default: '1h'
+        type: choice
+        options:
+          - '5m'
+          - '15m'
+          - '1h'
+          - '4h'
+          - '1d'
+      trade_amount:
+        description: 'Margin Per Trade in Rupees (₹)'
+        required: true
+        default: '1000'
+      leverage:
+        description: 'Leverage Multiplier'
+        required: true
+        default: '5'
+        type: choice
+        options:
+          - '1'
+          - '2'
+          - '3'
+          - '5'
+          - '10'
+          - '20'
+      direction:
+        description: 'Trade Direction'
+        required: true
+        default: 'both'
+        type: choice
+        options:
+          - 'both'
+          - 'long_only'
+          - 'short_only'
       strategy_type:
-        description: 'Strategy Type (reversal or breakout)'
+        description: 'Strategy Logic'
         required: true
         default: 'reversal'
         type: choice
         options:
-          - reversal
-          - breakout
-  # Optional: Run on a schedule (e.g., every Monday at 00:00 UTC)
-  # schedule:
-  #   - cron: '0 0 * * 1'
+          - 'reversal'
+          - 'breakout'
+      pivot_length:
+        description: 'Pivot Length (Candles to confirm)'
+        required: true
+        default: '15'
 
 jobs:
   backtest:
     runs-on: ubuntu-latest
 
     steps:
-      # Step 1: Check out the repository code
-      - name: Checkout Repository
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      # Step 2: Set up Python environment
-      - name: Set up Python 3.11
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip" # Caches pip dependencies for faster runs
+          cache: "pip"
 
-      # Step 3: Install dependencies
-      - name: Install Dependencies
+      - name: Install Libraries
         run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install numpy pandas yfinance
-          fi
+          pip install numpy pandas yfinance
 
-      # Step 4: Run the backtest script
-      - name: Execute Backtester
-        id: run_backtest
+      - name: Run Backtester
         run: |
-          # Pass workflow inputs as environment variables if triggered manually
-          export PIVOT_LENGTH="${{ github.event.inputs.pivot_length || '15' }}"
+          export COIN="${{ github.event.inputs.coin || 'BTC' }}"
+          export TIMEFRAME="${{ github.event.inputs.timeframe || '1h' }}"
+          export TRADE_AMOUNT="${{ github.event.inputs.trade_amount || '1000' }}"
+          export LEVERAGE="${{ github.event.inputs.leverage || '5' }}"
+          export DIRECTION="${{ github.event.inputs.direction || 'both' }}"
           export STRATEGY_TYPE="${{ github.event.inputs.strategy_type || 'reversal' }}"
-          
-          # Run python and pipe output to terminal and a log file
-          python backtest_pivots.py | tee backtest_output.log
+          export PIVOT_LENGTH="${{ github.event.inputs.pivot_length || '15' }}"
 
-      # Step 5: Publish Results to GitHub Job Summary (visible in GitHub UI)
-      - name: Publish Summary to GitHub
+          python backtest_pivots.py | tee output.log
+
+      - name: Show Results in GitHub Summary
         if: always()
         run: |
-          echo "## 📊 Pivot Points Backtest Results" >> $GITHUB_STEP_SUMMARY
-          echo "Ran with length: **${{ github.event.inputs.pivot_length || '15' }}** | Strategy: **${{ github.event.inputs.strategy_type || 'reversal' }}**" >> $GITHUB_STEP_SUMMARY
+          echo "## 🚀 Backtest Summary (₹ INR)" >> $GITHUB_STEP_SUMMARY
           echo '```text' >> $GITHUB_STEP_SUMMARY
-          cat backtest_output.log >> $GITHUB_STEP_SUMMARY
+          cat output.log >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-
-      # Step 6: Upload log file as an artifact
-      - name: Upload Backtest Logs
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: backtest-logs
-          path: backtest_output.log
