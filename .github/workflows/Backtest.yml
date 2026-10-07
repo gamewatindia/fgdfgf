@@ -24,7 +24,6 @@ on:
           - '30d'
           - '60d'
           - '180d'
-          - '360d'
       timeframe:
         description: 'Timeframe (1h recommended)'
         required: true
@@ -41,11 +40,12 @@ on:
       leverage:
         description: 'Leverage Multiplier'
         required: true
-        default: '10'
+        default: '5'
         type: choice
         options:
-          - '10'
           - '5'
+          - '7'
+          - '10'
           - '3'
       pivot_length:
         description: 'Pivot Length'
@@ -76,7 +76,7 @@ jobs:
           export PERIOD="${{ github.event.inputs.period || '30d' }}"
           export TIMEFRAME="${{ github.event.inputs.timeframe || '1h' }}"
           export TRADE_AMOUNT="${{ github.event.inputs.trade_amount || '1000' }}"
-          export LEVERAGE="${{ github.event.inputs.leverage || '10' }}"
+          export LEVERAGE="${{ github.event.inputs.leverage || '5' }}"
           export PIVOT_LENGTH="${{ github.event.inputs.pivot_length || '3' }}"
 
           python backtest_pivots.py | tee output.log
@@ -84,7 +84,7 @@ jobs:
       - name: Show Results in GitHub Summary
         if: always()
         run: |
-          echo "## 🚀 Adaptive Backtest Summary (₹ INR)" >> $GITHUB_STEP_SUMMARY
+          echo "## 🎯 Pivot Partial Booking Summary (₹ INR)" >> $GITHUB_STEP_SUMMARY
           echo '```text' >> $GITHUB_STEP_SUMMARY
           cat output.log >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
