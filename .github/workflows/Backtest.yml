@@ -1,109 +1,81 @@
-name: Pivot Backtest
+name: Run Pivot Points Backtest
 
+# Controls when the workflow will run
 on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  # Allows you to manually trigger the backtest from the GitHub Actions tab
   workflow_dispatch:
     inputs:
-      pair:
-        description: "USDT Pair"
+      pivot_length:
+        description: 'Pivot Length (Bars to Confirm)'
         required: true
-        default: "BTCUSDT"
-
-      days:
-        description: "Historical days"
+        default: '15'
+      strategy_type:
+        description: 'Strategy Type (reversal or breakout)'
         required: true
-        default: "30"
-
-      price:
-        description: "Price type"
-        required: true
+        default: 'reversal'
         type: choice
         options:
-          - LAST_PRICE
-          - MARK_PRICE
-          - INDEX_PRICE
-        default: LAST_PRICE
-
-      leverage:
-        description: "Leverage"
-        required: true
-        default: "10"
-
-      margin:
-        description: "Margin per trade (Rs)"
-        required: true
-        default: "1000"
-
-      sl:
-        description: "SL % (0 = OFF)"
-        required: true
-        default: "0"
-
-      length:
-        description: "Pivot length"
-        required: true
-        default: "50"
+          - reversal
+          - breakout
+  # Optional: Run on a schedule (e.g., every Monday at 00:00 UTC)
+  # schedule:
+  #   - cron: '0 0 * * 1'
 
 jobs:
   backtest:
-
     runs-on: ubuntu-latest
 
     steps:
-
-      - name: Checkout repository
+      # Step 1: Check out the repository code
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      # Step 2: Set up Python environment
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip" # Caches pip dependencies for faster runs
 
-      - name: Install dependencies
+      # Step 3: Install dependencies
+      - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy ccxt matplotlib
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install numpy pandas yfinance
+          fi
 
-      - name: Run pivot backtest
+      # Step 4: Run the backtest script
+      - name: Execute Backtester
+        id: run_backtest
         run: |
-          echo "========================================"
-          echo "RUNNING PIVOT BACKTEST"
-          echo "========================================"
+          # Pass workflow inputs as environment variables if triggered manually
+          export PIVOT_LENGTH="${{ github.event.inputs.pivot_length || '15' }}"
+          export STRATEGY_TYPE="${{ github.event.inputs.strategy_type || 'reversal' }}"
+          
+          # Run python and pipe output to terminal and a log file
+          python backtest_pivots.py | tee backtest_output.log
 
-          echo "Repository files:"
-          ls -lah
+      # Step 5: Publish Results to GitHub Job Summary (visible in GitHub UI)
+      - name: Publish Summary to GitHub
+        if: always()
+        run: |
+          echo "## 📊 Pivot Points Backtest Results" >> $GITHUB_STEP_SUMMARY
+          echo "Ran with length: **${{ github.event.inputs.pivot_length || '15' }}** | Strategy: **${{ github.event.inputs.strategy_type || 'reversal' }}**" >> $GITHUB_STEP_SUMMARY
+          echo '```text' >> $GITHUB_STEP_SUMMARY
+          cat backtest_output.log >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
 
-          echo ""
-          echo "Python file:"
-          ls -lh ./pivot_backtest.py
-
-          echo ""
-          echo "Starting backtest..."
-
-          python ./pivot_backtest.py \
-            --pair "${{ inputs.pair }}" \
-            --days "${{ inputs.days }}" \
-            --price "${{ inputs.price }}" \
-            --lev "${{ inputs.leverage }}" \
-            --margin "${{ inputs.margin }}" \
-            --sl "${{ inputs.sl }}" \
-            --length "${{ inputs.length }}"
-
-          echo ""
-          echo "========================================"
-          echo "BACKTEST FINISHED"
-          echo "========================================"
-
-          echo ""
-          echo "Output files:"
-          ls -lh backtest_all_trades.csv backtest_summary.csv equity_all.png
-
-      - name: Upload results
-        if: success()
+      # Step 6: Upload log file as an artifact
+      - name: Upload Backtest Logs
         uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: pivot-backtest-results
-          path: |
-            backtest_all_trades.csv
-            backtest_summary.csv
-            equity_all.png
-          if-no-files-found: error
+          name: backtest-logs
+          path: backtest_output.log
