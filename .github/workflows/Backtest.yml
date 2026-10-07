@@ -16,20 +16,18 @@ on:
           - SOL
           - DOGE
           - XRP
-          - ADA
       timeframe:
         description: 'Select Timeframe'
         required: true
         default: '1h'
         type: choice
         options:
-          - '5m'
           - '15m'
           - '1h'
           - '4h'
           - '1d'
       trade_amount:
-        description: 'Margin Per Trade in Rupees (₹)'
+        description: 'Margin Per Trade (₹ INR)'
         required: true
         default: '1000'
       leverage:
@@ -43,7 +41,6 @@ on:
           - '3'
           - '5'
           - '10'
-          - '20'
       direction:
         description: 'Trade Direction'
         required: true
@@ -54,15 +51,15 @@ on:
           - 'long_only'
           - 'short_only'
       strategy_type:
-        description: 'Strategy Logic'
+        description: 'Strategy Logic (Breakout recommended)'
         required: true
-        default: 'reversal'
+        default: 'breakout'
         type: choice
         options:
-          - 'reversal'
           - 'breakout'
+          - 'reversal'
       pivot_length:
-        description: 'Pivot Length (Candles to confirm)'
+        description: 'Pivot Length'
         required: true
         default: '15'
 
@@ -91,7 +88,7 @@ jobs:
           export TRADE_AMOUNT="${{ github.event.inputs.trade_amount || '1000' }}"
           export LEVERAGE="${{ github.event.inputs.leverage || '5' }}"
           export DIRECTION="${{ github.event.inputs.direction || 'both' }}"
-          export STRATEGY_TYPE="${{ github.event.inputs.strategy_type || 'reversal' }}"
+          export STRATEGY_TYPE="${{ github.event.inputs.strategy_type || 'breakout' }}"
           export PIVOT_LENGTH="${{ github.event.inputs.pivot_length || '15' }}"
 
           python backtest_pivots.py | tee output.log
@@ -99,7 +96,7 @@ jobs:
       - name: Show Results in GitHub Summary
         if: always()
         run: |
-          echo "## 🚀 Backtest Summary (₹ INR)" >> $GITHUB_STEP_SUMMARY
+          echo "## 🚀 Improved Backtest Summary (₹ INR)" >> $GITHUB_STEP_SUMMARY
           echo '```text' >> $GITHUB_STEP_SUMMARY
           cat output.log >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
