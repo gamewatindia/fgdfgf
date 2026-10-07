@@ -1,68 +1,75 @@
 """
-Pivot High/Low (LuxAlgo-style) Backtest
-ALL TIMEFRAMES: 5m, 15m, 30m, 1h, 4h
+PIVOT HIGH/LOW LUXALGO-STYLE BACKTEST
 
-Strategy:
-- Confirmed pivot LOW -> LONG
-- Confirmed pivot HIGH -> SHORT
-- Entry = close of confirmation candle
-- No look-ahead
+TIMEFRAMES:
+5m, 15m, 30m, 1h, 4h
+
+ENTRY:
+Confirmed Pivot LOW  -> LONG
+Confirmed Pivot HIGH -> SHORT
+
+ENTRY PRICE:
+Confirmation candle CLOSE
+
+INITIAL STOP LOSS:
+LONG  -> Confirmation candle LOW
+SHORT -> Confirmation candle HIGH
 
 POSITION:
-- Margin = Rs 1000
-- Leverage = 10x
-- Total position = Rs 10000
+Margin    = Rs 1000
+Leverage  = 10x
+Notional  = Rs 10000
 
-75% POSITION:
-- Fixed TP = +2% price movement
+TAKE PROFIT:
+75% position closes at +2% price movement.
 
-25% RUNNER:
-- After 75% TP -> SL moves to breakeven
-- Then closes at:
-  - Breakeven
-  - Opposite pivot
-  - Liquidation
-  - End of data
+RUNNER:
+25% remains after TP.
 
-Optional original SL:
-- --sl 4 = 4% price movement against position
-- Applies only before 2% TP
+After 75% TP:
+Runner SL = Entry price (BREAKEVEN)
+
+Runner closes at:
+- Breakeven
+- Opposite pivot
+- Liquidation
+- End of data
 
 OUTPUT:
-- backtest_all_trades.csv
-- backtest_summary.csv
-- equity_all.png
+backtest_all_trades.csv
+backtest_summary.csv
+equity_all.png
 """
 
 import argparse
 import os
 import time
 import pandas as pd
-import numpy as np
 
 
 # =========================================================
-# CONFIGURATION
+# CONFIG
 # =========================================================
 
 MARGIN = 1000.0
 LEV = 10.0
 
-# Maintenance margin
 MMR = 0.005
 
-# 0.10 = 0.10% per side
+# Fee per side = 0.10%
 FEE_PCT = 0.10
-
-# Default SL OFF
-SL = 0.0
 
 # 75% position TP
 TP_PCT = 2.0
+
 TP_PART = 0.75
 RUNNER_PART = 0.25
 
-# Timeframes
+
+# =========================================================
+# TIMEFRAMES
+# =========================================================
+
 TFS = [
     "5m",
     "15m",
@@ -120,7 +127,11 @@ def norm_pair(pair):
 
     if "/" not in pair:
 
-        for quote in ("USDT", "USDC", "USD"):
+        for quote in (
+            "USDT",
+            "USDC",
+            "USD"
+        ):
 
             if pair.endswith(quote):
 
@@ -134,7 +145,7 @@ def norm_pair(pair):
 
 
 # =========================================================
-# FETCH OHLCV
+# FETCH DATA
 # =========================================================
 
 def fetch(
@@ -158,6 +169,7 @@ def fetch(
     for exchange_name in EXCHANGES[price]:
 
         if exchange_name not in order:
+
             order.append(exchange_name)
 
     for exchange_name in order:
@@ -250,7 +262,7 @@ def fetch(
                 )
 
             # ---------------------------------------------
-            # TIME RANGE
+            # TIME
             # ---------------------------------------------
 
             timeframe_ms = (
@@ -268,17 +280,13 @@ def fetch(
 
             rows = []
 
-            # ---------------------------------------------
-            # DOWNLOAD IN CHUNKS
-            # ---------------------------------------------
-
-            safety_counter = 0
+            safety = 0
 
             while since < now:
 
-                safety_counter += 1
+                safety += 1
 
-                if safety_counter > 100:
+                if safety > 100:
 
                     break
 
@@ -290,6 +298,7 @@ def fetch(
                 )
 
                 if not candles:
+
                     break
 
                 rows.extend(candles)
@@ -313,8 +322,8 @@ def fetch(
                 )
 
             if len(rows) < max(
-                2 * warmup,
-                100
+                100,
+                warmup * 2
             ):
 
                 raise ValueError(
@@ -357,9 +366,15 @@ def fetch(
             df = (
                 df
                 .dropna()
-                .drop_duplicates("time")
-                .sort_values("time")
-                .reset_index(drop=True)
+                .drop_duplicates(
+                    "time"
+                )
+                .sort_values(
+                    "time"
+                )
+                .reset_index(
+                    drop=True
+                )
             )
 
             print(
@@ -374,23 +389,27 @@ def fetch(
 
         except Exception as error:
 
-            msg = (
+            message = (
                 f"{exchange_name}: "
                 f"{str(error)[:150]}"
             )
 
             print(
-                f"[{tf}] {msg}"
+                f"[{tf}] {message}"
             )
 
-            errors.append(msg)
+            errors.append(
+                message
+            )
 
             try:
 
                 if exchange is not None:
+
                     exchange.close()
 
             except Exception:
+
                 pass
 
     raise RuntimeError(
@@ -425,21 +444,38 @@ def backtest(
 
     cutoff = (
         times.iloc[-1]
-        - pd.Timedelta(days=days)
+        - pd.Timedelta(
+            days=days
+        )
     )
 
     trades = []
 
     pivots = 0
 
+    # -----------------------------------------------------
+    # POSITION
+    # -----------------------------------------------------
+
     position = 0
+
+    # 1 = LONG
+    # -1 = SHORT
 
     entry_price = None
     entry_time = None
 
+    # NEW:
+    # Entry candle based SL
+    entry_sl = None
+
     trade_id = 0
 
     tp_hit = False
+
+    # -----------------------------------------------------
+    # POSITION SIZE
+    # -----------------------------------------------------
 
     total_notional = (
         MARGIN * LEV
@@ -455,38 +491,40 @@ def backtest(
         * RUNNER_PART
     )
 
+    # -----------------------------------------------------
+    # TP
+    # -----------------------------------------------------
+
     tp_distance = (
         TP_PCT / 100.0
     )
+
+    # -----------------------------------------------------
+    # LIQUIDATION
+    # -----------------------------------------------------
 
     liquidation_distance = max(
         1.0 / LEV - MMR,
         0.001
     )
 
-    stop_distance = None
-
-    if SL > 0:
-
-        candidate = SL / 100.0
-
-        if candidate < liquidation_distance:
-
-            stop_distance = candidate
-
 
     # =====================================================
-    # HELPERS
+    # HELPER: SIDE
     # =====================================================
 
     def get_side():
 
-        return (
-            "LONG"
-            if position == 1
-            else "SHORT"
-        )
+        if position == 1:
 
+            return "LONG"
+
+        return "SHORT"
+
+
+    # =====================================================
+    # HELPER: PNL
+    # =====================================================
 
     def calculate_pnl(
         nominal,
@@ -514,6 +552,10 @@ def backtest(
         )
 
 
+    # =====================================================
+    # HELPER: FEES
+    # =====================================================
+
     def calculate_fee(
         nominal
     ):
@@ -525,6 +567,10 @@ def backtest(
             * 2.0
         )
 
+
+    # =====================================================
+    # RECORD TRADE
+    # =====================================================
 
     def record_trade(
         portion,
@@ -543,8 +589,11 @@ def backtest(
             nominal
         )
 
-        net = gross - fees
+        net = (
+            gross - fees
+        )
 
+        # Liquidation
         if status == "LIQUIDATED":
 
             net = -nominal
@@ -568,6 +617,14 @@ def backtest(
                     entry_price,
                     8
                 ),
+
+            "entry_sl":
+                round(
+                    entry_sl,
+                    8
+                )
+                if entry_sl is not None
+                else None,
 
             "exit_time":
                 exit_time,
@@ -625,7 +682,7 @@ def backtest(
         if position != 0:
 
             # =============================================
-            # 75% TP
+            # 1. 75% TP
             # =============================================
 
             if not tp_hit:
@@ -674,83 +731,77 @@ def backtest(
 
 
             # =============================================
-            # ORIGINAL STOP LOSS
+            # 2. ENTRY CANDLE SL
+            #
+            # LONG  -> entry candle LOW
+            # SHORT -> entry candle HIGH
+            #
             # ONLY BEFORE TP
             # =============================================
 
             if (
                 position != 0
                 and not tp_hit
-                and stop_distance is not None
+                and entry_sl is not None
             ):
 
                 if position == 1:
 
-                    adverse = (
-                        entry_price
-                        - low[i]
-                    ) / entry_price
+                    # LONG:
+                    # candle low touches SL
 
-                    if adverse >= stop_distance:
-
-                        stop_price = (
-                            entry_price
-                            * (
-                                1
-                                - stop_distance
-                            )
-                        )
+                    if low[i] <= entry_sl:
 
                         record_trade(
                             "100%",
-                            stop_price,
+                            entry_sl,
                             times.iloc[i],
-                            "STOP LOSS",
+                            "ENTRY CANDLE SL",
                             total_notional
                         )
 
                         position = 0
+
                         entry_price = None
+
                         entry_time = None
+
+                        entry_sl = None
+
                         tp_hit = False
 
                         continue
 
                 else:
 
-                    adverse = (
-                        high[i]
-                        - entry_price
-                    ) / entry_price
+                    # SHORT:
+                    # candle high touches SL
 
-                    if adverse >= stop_distance:
-
-                        stop_price = (
-                            entry_price
-                            * (
-                                1
-                                + stop_distance
-                            )
-                        )
+                    if high[i] >= entry_sl:
 
                         record_trade(
                             "100%",
-                            stop_price,
+                            entry_sl,
                             times.iloc[i],
-                            "STOP LOSS",
+                            "ENTRY CANDLE SL",
                             total_notional
                         )
 
                         position = 0
+
                         entry_price = None
+
                         entry_time = None
+
+                        entry_sl = None
+
                         tp_hit = False
 
                         continue
 
 
             # =============================================
-            # RUNNER BREAKEVEN
+            # 3. RUNNER BREAKEVEN
             # =============================================
 
             if (
@@ -771,8 +822,13 @@ def backtest(
                         )
 
                         position = 0
+
                         entry_price = None
+
                         entry_time = None
+
+                        entry_sl = None
+
                         tp_hit = False
 
                         continue
@@ -790,15 +846,20 @@ def backtest(
                         )
 
                         position = 0
+
                         entry_price = None
+
                         entry_time = None
+
+                        entry_sl = None
+
                         tp_hit = False
 
                         continue
 
 
             # =============================================
-            # LIQUIDATION
+            # 4. LIQUIDATION
             # =============================================
 
             if position != 0:
@@ -841,8 +902,13 @@ def backtest(
                             )
 
                         position = 0
+
                         entry_price = None
+
                         entry_time = None
+
+                        entry_sl = None
+
                         tp_hit = False
 
                         continue
@@ -881,1039 +947,4 @@ def backtest(
                                 liquidation_price,
                                 times.iloc[i],
                                 "LIQUIDATED",
-                                total_notional
-                            )
-
-                        position = 0
-                        entry_price = None
-                        entry_time = None
-                        tp_hit = False
-
-                        continue
-
-
-        # =================================================
-        # PIVOT DETECTION
-        # =================================================
-
-        pivot_index = i - length
-
-        left_start = (
-            pivot_index - length
-        )
-
-        if left_start < 0:
-
-            continue
-
-        window_high = high[
-            left_start:
-            i + 1
-        ]
-
-        window_low = low[
-            left_start:
-            i + 1
-        ]
-
-        pivot_high = (
-            high[pivot_index]
-            == window_high.max()
-            and
-            (
-                window_high
-                == high[pivot_index]
-            ).sum()
-            == 1
-        )
-
-        pivot_low = (
-            low[pivot_index]
-            == window_low.min()
-            and
-            (
-                window_low
-                == low[pivot_index]
-            ).sum()
-            == 1
-        )
-
-        if not (
-            pivot_high
-            or pivot_low
-        ):
-
-            continue
-
-        if times.iloc[i] < cutoff:
-
-            continue
-
-        pivots += 1
-
-        # ================================================
-        # PIVOT HIGH -> SHORT
-        # PIVOT LOW  -> LONG
-        # ================================================
-
-        if pivot_high:
-
-            new_direction = -1
-
-        else:
-
-            new_direction = 1
-
-
-        # ================================================
-        # SAME DIRECTION
-        # ================================================
-
-        if new_direction == position:
-
-            continue
-
-
-        # ================================================
-        # OPPOSITE PIVOT
-        # ================================================
-
-        if position != 0:
-
-            if tp_hit:
-
-                record_trade(
-                    "25%",
-                    close[i],
-                    times.iloc[i],
-                    "closed",
-                    runner_notional
-                )
-
-            else:
-
-                record_trade(
-                    "100%",
-                    close[i],
-                    times.iloc[i],
-                    "closed",
-                    total_notional
-                )
-
-            position = 0
-            entry_price = None
-            entry_time = None
-            tp_hit = False
-
-
-        # ================================================
-        # OPEN NEW POSITION
-        # ================================================
-
-        trade_id += 1
-
-        position = new_direction
-
-        entry_price = close[i]
-
-        entry_time = times.iloc[i]
-
-        tp_hit = False
-
-
-    # =====================================================
-    # CLOSE OPEN POSITION AT END
-    # =====================================================
-
-    if position != 0:
-
-        if tp_hit:
-
-            record_trade(
-                "25%",
-                close[-1],
-                times.iloc[-1],
-                "open (MTM)",
-                runner_notional
-            )
-
-        else:
-
-            record_trade(
-                "100%",
-                close[-1],
-                times.iloc[-1],
-                "open (MTM)",
-                total_notional
-            )
-
-
-    return (
-        pd.DataFrame(trades),
-        pivots
-    )
-
-
-# =========================================================
-# SUMMARY
-# =========================================================
-
-def summarize(
-    tf,
-    trades,
-    pivots,
-    error=""
-):
-
-    result = {
-
-        "tf": tf,
-
-        "pivots": pivots,
-
-        "trades": 0,
-
-        "long": 0,
-
-        "short": 0,
-
-        "wins": 0,
-
-        "losses": 0,
-
-        "win_pct": 0.0,
-
-        "net_pnl": 0.0,
-
-        "realised": 0.0,
-
-        "open_mtm": 0.0,
-
-        "fees": 0.0,
-
-        "liq": 0,
-
-        "sl_hits": 0,
-
-        "tp_hits": 0,
-
-        "breakeven": 0,
-
-        "profit_factor": 0.0,
-
-        "max_dd": 0.0,
-
-        "note": error
-    }
-
-    if trades.empty:
-
-        return result
-
-
-    # =====================================================
-    # BASIC
-    # =====================================================
-
-    result["long"] = int(
-        (trades["side"] == "LONG").sum()
-    )
-
-    result["short"] = int(
-        (trades["side"] == "SHORT").sum()
-    )
-
-    result["fees"] = round(
-        trades["fees"].sum(),
-        2
-    )
-
-    result["liq"] = int(
-        (
-            trades["status"]
-            == "LIQUIDATED"
-        ).sum()
-    )
-
-    result["sl_hits"] = int(
-        (
-            trades["status"]
-            == "STOP LOSS"
-        ).sum()
-    )
-
-    result["tp_hits"] = int(
-        (
-            trades["status"]
-            == "TP 2%"
-        ).sum()
-    )
-
-    result["breakeven"] = int(
-        (
-            trades["status"]
-            == "BREAKEVEN"
-        ).sum()
-    )
-
-
-    # =====================================================
-    # GROUP PARTIALS INTO REAL TRADES
-    # =====================================================
-
-    grouped = (
-        trades
-        .groupby("trade_id", as_index=False)
-        .agg({
-
-            "side": "first",
-
-            "net_pnl": "sum",
-
-            "gross_pnl": "sum",
-
-            "fees": "sum",
-
-            "status": lambda x:
-                "|".join(
-                    x.astype(str)
-                )
-        })
-    )
-
-    result["trades"] = int(
-        len(grouped)
-    )
-
-
-    # =====================================================
-    # WIN / LOSS
-    # =====================================================
-
-    wins = grouped[
-        grouped["net_pnl"] > 0
-    ]
-
-    losses = grouped[
-        grouped["net_pnl"] < 0
-    ]
-
-    result["wins"] = int(
-        len(wins)
-    )
-
-    result["losses"] = int(
-        len(losses)
-    )
-
-    if result["trades"] > 0:
-
-        result["win_pct"] = round(
-            result["wins"]
-            / result["trades"]
-            * 100.0,
-            2
-        )
-
-
-    # =====================================================
-    # PNL
-    # =====================================================
-
-    total_pnl = grouped[
-        "net_pnl"
-    ].sum()
-
-    result["net_pnl"] = round(
-        total_pnl,
-        2
-    )
-
-
-    open_rows = trades[
-        trades["status"]
-        == "open (MTM)"
-    ]
-
-    result["open_mtm"] = round(
-        open_rows["net_pnl"].sum()
-        if not open_rows.empty
-        else 0.0,
-        2
-    )
-
-    result["realised"] = round(
-        total_pnl
-        - result["open_mtm"],
-        2
-    )
-
-
-    # =====================================================
-    # PROFIT FACTOR
-    # =====================================================
-
-    gross_profit = wins[
-        "net_pnl"
-    ].sum()
-
-    gross_loss = abs(
-        losses[
-            "net_pnl"
-        ].sum()
-    )
-
-    if gross_loss > 0:
-
-        result["profit_factor"] = round(
-            gross_profit
-            / gross_loss,
-            3
-        )
-
-    elif gross_profit > 0:
-
-        result["profit_factor"] = float(
-            "inf"
-        )
-
-
-    # =====================================================
-    # MAX DRAWDOWN
-    # =====================================================
-
-    equity = grouped[
-        "net_pnl"
-    ].cumsum()
-
-    peak = equity.cummax()
-
-    drawdown = equity - peak
-
-    if len(drawdown):
-
-        result["max_dd"] = round(
-            drawdown.min(),
-            2
-        )
-
-
-    return result
-
-
-# =========================================================
-# EQUITY CURVE
-# =========================================================
-
-def make_equity_chart(
-    all_trades
-):
-
-    try:
-
-        import matplotlib
-
-        matplotlib.use(
-            "Agg"
-        )
-
-        import matplotlib.pyplot as plt
-
-        plt.figure(
-            figsize=(14, 8)
-        )
-
-        plotted = False
-
-        for tf in TFS:
-
-            tf_trades = all_trades[
-                all_trades["tf"] == tf
-            ].copy()
-
-            if tf_trades.empty:
-
-                continue
-
-            # Aggregate partials
-            equity_data = (
-                tf_trades
-                .groupby(
-                    "trade_id",
-                    as_index=False
-                )["net_pnl"]
-                .sum()
-            )
-
-            equity = (
-                equity_data["net_pnl"]
-                .cumsum()
-            )
-
-            plt.plot(
-                range(
-                    1,
-                    len(equity) + 1
-                ),
-                equity,
-                label=tf
-            )
-
-            plotted = True
-
-        plt.axhline(
-            0,
-            linewidth=1
-        )
-
-        plt.title(
-            "Pivot Backtest Equity Curve"
-        )
-
-        plt.xlabel(
-            "Completed Trades"
-        )
-
-        plt.ylabel(
-            "Cumulative Net PnL (Rs)"
-        )
-
-        if plotted:
-
-            plt.legend()
-
-        plt.grid(
-            alpha=0.3
-        )
-
-        plt.tight_layout()
-
-        plt.savefig(
-            "equity_all.png",
-            dpi=150
-        )
-
-        plt.close()
-
-    except Exception as error:
-
-        print(
-            f"Equity chart warning: {error}"
-        )
-
-
-# =========================================================
-# MAIN
-# =========================================================
-
-def main():
-
-    global MARGIN
-    global LEV
-    global SL
-
-    parser = argparse.ArgumentParser(
-        description=(
-            "Pivot High/Low "
-            "LuxAlgo-style Backtest"
-        )
-    )
-
-    parser.add_argument(
-        "--pair",
-        required=True,
-        help="USDT pair e.g. BTCUSDT"
-    )
-
-    parser.add_argument(
-        "--days",
-        type=int,
-        required=True,
-        help="Historical days"
-    )
-
-    parser.add_argument(
-        "--price",
-        choices=[
-            "LAST_PRICE",
-            "MARK_PRICE",
-            "INDEX_PRICE"
-        ],
-        default="LAST_PRICE"
-    )
-
-    parser.add_argument(
-        "--lev",
-        type=float,
-        default=10.0
-    )
-
-    parser.add_argument(
-        "--margin",
-        type=float,
-        default=1000.0
-    )
-
-    parser.add_argument(
-        "--sl",
-        type=float,
-        default=0.0
-    )
-
-    parser.add_argument(
-        "--first",
-        default=""
-    )
-
-    parser.add_argument(
-        "--length",
-        type=int,
-        default=50
-    )
-
-    args = parser.parse_args()
-
-
-    # =====================================================
-    # APPLY SETTINGS
-    # =====================================================
-
-    MARGIN = float(
-        args.margin
-    )
-
-    LEV = float(
-        args.lev
-    )
-
-    SL = float(
-        args.sl
-    )
-
-    pair = norm_pair(
-        args.pair
-    )
-
-    days = int(
-        args.days
-    )
-
-    length = int(
-        args.length
-    )
-
-    if days <= 0:
-
-        raise ValueError(
-            "days must be > 0"
-        )
-
-    if length < 2:
-
-        raise ValueError(
-            "length must be >= 2"
-        )
-
-    if LEV <= 0:
-
-        raise ValueError(
-            "leverage must be > 0"
-        )
-
-    if MARGIN <= 0:
-
-        raise ValueError(
-            "margin must be > 0"
-        )
-
-
-    # =====================================================
-    # HEADER
-    # =====================================================
-
-    print()
-    print(
-        "=" * 80
-    )
-
-    print(
-        "PIVOT HIGH/LOW BACKTEST"
-    )
-
-    print(
-        "=" * 80
-    )
-
-    print(
-        f"Pair       : {pair}"
-    )
-
-    print(
-        f"Price      : {args.price}"
-    )
-
-    print(
-        f"Days       : {days}"
-    )
-
-    print(
-        f"Length     : {length}"
-    )
-
-    print(
-        f"Margin     : Rs {MARGIN:.2f}"
-    )
-
-    print(
-        f"Leverage   : {LEV:.1f}x"
-    )
-
-    print(
-        f"Position   : Rs {MARGIN * LEV:.2f}"
-    )
-
-    print(
-        f"75% TP     : {TP_PCT:.2f}%"
-    )
-
-    print(
-        f"Runner     : {RUNNER_PART * 100:.0f}%"
-    )
-
-    print(
-        f"SL         : "
-        f"{SL:.2f}%"
-    )
-
-    print(
-        f"Fee/side   : "
-        f"{FEE_PCT:.2f}%"
-    )
-
-    print(
-        "=" * 80
-    )
-
-    print()
-
-
-    # =====================================================
-    # RESULTS
-    # =====================================================
-
-    all_trade_frames = []
-
-    summaries = []
-
-
-    # =====================================================
-    # RUN ALL TIMEFRAMES
-    # =====================================================
-
-    for tf in TFS:
-
-        print()
-        print(
-            "=" * 80
-        )
-
-        print(
-            f"RUNNING {tf}"
-        )
-
-        print(
-            "=" * 80
-        )
-
-        try:
-
-            # ---------------------------------------------
-            # Fetch data
-            # ---------------------------------------------
-
-            warmup = (
-                length * 2
-                + 10
-            )
-
-            df = fetch(
-                pair=pair,
-                tf=tf,
-                days=days,
-                warmup=warmup,
-                price=args.price,
-                first=args.first
-            )
-
-            # ---------------------------------------------
-            # Backtest
-            # ---------------------------------------------
-
-            trades, pivots = backtest(
-                df=df,
-                length=length,
-                days=days,
-                tf=tf
-            )
-
-            # ---------------------------------------------
-            # Summary
-            # ---------------------------------------------
-
-            summary = summarize(
-                tf=tf,
-                trades=trades,
-                pivots=pivots
-            )
-
-            summaries.append(
-                summary
-            )
-
-            if not trades.empty:
-
-                all_trade_frames.append(
-                    trades
-                )
-
-            print()
-            print(
-                f"[{tf}] "
-                f"pivots={pivots} "
-                f"trades={summary['trades']} "
-                f"wins={summary['wins']} "
-                f"win%={summary['win_pct']:.2f} "
-                f"net PnL=Rs {summary['net_pnl']:.2f}"
-            )
-
-        except Exception as error:
-
-            print()
-            print(
-                f"[{tf}] ERROR:"
-            )
-
-            print(
-                str(error)
-            )
-
-            summaries.append(
-                summarize(
-                    tf=tf,
-                    trades=pd.DataFrame(),
-                    pivots=0,
-                    error=str(error)
-                )
-            )
-
-
-    # =====================================================
-    # COMBINE TRADES
-    # =====================================================
-
-    if all_trade_frames:
-
-        all_trades = pd.concat(
-            all_trade_frames,
-            ignore_index=True
-        )
-
-    else:
-
-        all_trades = pd.DataFrame(
-            columns=[
-                "trade_id",
-                "tf",
-                "side",
-                "entry_time",
-                "entry_price",
-                "exit_time",
-                "exit_price",
-                "portion",
-                "gross_pnl",
-                "fees",
-                "net_pnl",
-                "status"
-            ]
-        )
-
-
-    # =====================================================
-    # SAVE ALL TRADES
-    # =====================================================
-
-    all_trades.to_csv(
-        "backtest_all_trades.csv",
-        index=False
-    )
-
-
-    # =====================================================
-    # SAVE SUMMARY
-    # =====================================================
-
-    summary_df = pd.DataFrame(
-        summaries
-    )
-
-    summary_df.to_csv(
-        "backtest_summary.csv",
-        index=False
-    )
-
-
-    # =====================================================
-    # EQUITY CHART
-    # =====================================================
-
-    if not all_trades.empty:
-
-        make_equity_chart(
-            all_trades
-        )
-
-    else:
-
-        # Create an empty valid PNG
-        try:
-
-            import matplotlib
-
-            matplotlib.use(
-                "Agg"
-            )
-
-            import matplotlib.pyplot as plt
-
-            plt.figure(
-                figsize=(14, 8)
-            )
-
-            plt.title(
-                "Pivot Backtest - No Trades"
-            )
-
-            plt.axhline(
-                0
-            )
-
-            plt.tight_layout()
-
-            plt.savefig(
-                "equity_all.png",
-                dpi=150
-            )
-
-            plt.close()
-
-        except Exception as error:
-
-            print(
-                f"Could not create "
-                f"empty equity chart: {error}"
-            )
-
-
-    # =====================================================
-    # PRINT SUMMARY
-    # =====================================================
-
-    print()
-    print(
-        "=" * 100
-    )
-
-    print(
-        "BACKTEST SUMMARY"
-    )
-
-    print(
-        "=" * 100
-    )
-
-    if not summary_df.empty:
-
-        display_columns = [
-            "tf",
-            "pivots",
-            "trades",
-            "long",
-            "short",
-            "wins",
-            "losses",
-            "win_pct",
-            "net_pnl",
-            "realised",
-            "open_mtm",
-            "fees",
-            "liq",
-            "sl_hits",
-            "tp_hits",
-            "breakeven",
-            "profit_factor",
-            "max_dd"
-        ]
-
-        print(
-            summary_df[
-                display_columns
-            ].to_string(
-                index=False
-            )
-        )
-
-
-    # =====================================================
-    # FINAL FILE CHECK
-    # =====================================================
-
-    print()
-    print(
-        "=" * 100
-    )
-
-    print(
-        "OUTPUT FILES"
-    )
-
-    print(
-        "=" * 100
-    )
-
-    for filename in [
-        "backtest_all_trades.csv",
-        "backtest_summary.csv",
-        "equity_all.png"
-    ]:
-
-        if os.path.exists(filename):
-
-            size = os.path.getsize(
-                filename
-            )
-
-            print(
-                f"OK   {filename} "
-                f"({size} bytes)"
-            )
-
-        else:
-
-            print(
-                f"ERROR {filename} MISSING"
-            )
-
-
-    print()
-    print(
-        "BACKTEST COMPLETED SUCCESSFULLY"
-    )
-
-
-# =========================================================
-# ENTRY POINT
-# =========================================================
-
-if __name__ == "__main__":
-
-    main()
+                                total
