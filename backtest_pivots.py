@@ -28,14 +28,14 @@ def fetch_crypto_data(coin="ETH", timeframe="1h", period="30d"):
 
     # Fallback simulation if offline
     if df is None or len(df) < 50:
-        print("⚠️ Generating fallback simulation...")
+        print("⚠️ Generating fallback candles...")
         np.random.seed(42)
-        n = 3000
+        n = 2000
         base = 5800000.0 if "BTC" in symbol else (280000.0 if "ETH" in symbol else 12500.0)
-        ret = np.random.normal(0.0002, 0.015, n)
+        ret = np.random.normal(0.0002, 0.012, n)
         prices = base * np.exp(np.cumsum(ret))
-        highs = prices * (1 + np.abs(np.random.normal(0, 0.006, n)))
-        lows = prices * (1 - np.abs(np.random.normal(0, 0.006, n)))
+        highs = prices * (1 + np.abs(np.random.normal(0, 0.005, n)))
+        lows = prices * (1 - np.abs(np.random.normal(0, 0.005, n)))
         closes = prices
         opens = np.roll(closes, 1)
         opens[0] = closes[0]
@@ -46,176 +46,104 @@ def fetch_crypto_data(coin="ETH", timeframe="1h", period="30d"):
 
 
 # =====================================================================
-# 2. ADAPTIVE QUANT ENGINE (Auto-Scales SL/TP by Timeframe)
+# 2. PIVOT PARTIAL BOOKING STRATEGY (75% TP1 + 25% Runner at Breakeven)
 # =====================================================================
-def run_pivot_backtest(df, timeframe="1h", length=3, margin_inr=1000.0, 
-                       leverage=10.0, direction="both", fee_pct=0.0005):
+def run_pivot_strategy(df, length=3, margin_inr=1000.0, leverage=5.0, 
+                       direction="both", fee_pct=0.0005):
+    """
+    Rules:
+    - Entry: Pivot confirmation
+    - SL: Thode niche of Pivot Point (0.3% buffer)
+    - TP1: 75% Qty booked at Nearest Resistance / Support
+    - SL to Breakeven once TP1 is hit
+    - TP2: 25% Qty targets Next Pivot Extension
+    """
     n = len(df)
     highs = df['High'].values
     lows = df['Low'].values
     closes = df['Close'].values
 
-    # Auto-adjust SL & TP to be realistic for each timeframe
-    if timeframe == "15m":
-        sl_pct = 0.012  # 1.2% SL
-        tp_pct = 0.025  # 2.5% TP (Achievable in 15m)
-        be_trigger = 0.015  # Breakeven lock at +1.5%
-    elif timeframe == "1h":
-        sl_pct = 0.020  # 2.0% SL
-        tp_pct = 0.050  # 5.0% TP
-        be_trigger = 0.025  # Breakeven lock at +2.5%
-    else:
-        sl_pct = 0.030
-        tp_pct = 0.070
-        be_trigger = 0.035
+    # Pivot Point Identification
+    ph = np.zeros(n, dtype=bool)
+    pl = np.zeros(n, dtype=bool)
+    ph_val = np.full(n, np.nan)
+    pl_val = np.full(n, np.nan)
 
-    # 1. ADX (14) for Chop/Range Elimination
-    tr1 = highs[1:] - lows[1:]
-    tr2 = np.abs(highs[1:] - closes[:-1])
-    tr3 = np.abs(lows[1:] - closes[:-1])
-    tr = np.maximum(tr1, np.maximum(tr2, tr3))
-
-    up_move = highs[1:] - highs[:-1]
-    down_move = lows[:-1] - lows[1:]
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-    
-    tr_smooth = pd.Series(tr).rolling(14, min_periods=1).mean() + 1e-9
-    plus_di = 100 * pd.Series(plus_dm).rolling(14, min_periods=1).mean() / tr_smooth
-    minus_di = 100 * pd.Series(minus_dm).rolling(14, min_periods=1).mean() / tr_smooth
-    dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)
-    adx = np.zeros(n)
-    adx[1:] = dx.rolling(14, min_periods=1).mean().values
-
-    # 2. 50 EMA for Trend Direction
-    ema50 = pd.Series(closes).ewm(span=50, adjust=False).mean().values
-
-    # 3. Fast Pivot Detection
-    ph_arr = np.zeros(n, dtype=bool)
-    pl_arr = np.zeros(n, dtype=bool)
     for i in range(2 * length, n):
         wh = highs[i - 2 * length : i + 1]
         wl = lows[i - 2 * length : i + 1]
         if (highs[i - length] == np.max(wh)) and (np.sum(wh == highs[i - length]) == 1):
-            ph_arr[i] = True
+            ph[i] = True
+            ph_val[i] = highs[i - length]
         if (lows[i - length] == np.min(wl)) and (np.sum(wl == lows[i - length]) == 1):
-            pl_arr[i] = True
+            pl[i] = True
+            pl_val[i] = lows[i - length]
 
-    # 4. Trade Execution with Breakeven Protection
-    pos = 0
-    entry_price = 0.0
-    highest_seen = 0.0
-    lowest_seen = 1e12
-    trades_pnl = []
+    # Trend Guide (50 EMA)
+    ema50 = pd.Series(closes).ewm(span=50, adjust=False).mean().values
 
     pos_value = margin_inr * leverage
-    round_trip_fee = pos_value * fee_pct * 2
+    fee_rate = fee_pct * 2
 
-    for i in range(25, n):
-        # Position Exit Check
+    last_resistance = np.nan
+    last_support = np.nan
+
+    pos = 0  # 1 = Long, -1 = Short
+    entry_price = 0.0
+    sl_price = 0.0
+    tp1_price = 0.0
+    tp2_price = 0.0
+    stage = 0  # 1 = Initial (100%), 2 = TP1 Hit (25% remaining at Breakeven)
+
+    trades_pnl = []
+    trade_cycles = 0
+    tp1_hits = 0
+    tp2_hits = 0
+    be_hits = 0
+    sl_hits = 0
+
+    for i in range(2 * length, n):
+        # Update Nearest Pivot Levels
+        if ph[i]:
+            last_resistance = ph_val[i]
+        if pl[i]:
+            last_support = pl_val[i]
+
+        # ----------------- Manage Active Trade -----------------
         if pos != 0:
-            closed = False
-            pnl = 0.0
+            if pos == 1:  # LONG TRADE
+                if stage == 1:
+                    # Case A: Full SL Hit (Pivot low breached)
+                    if lows[i] <= sl_price:
+                        pnl = pos_value * (sl_price - entry_price) / entry_price - pos_value * fee_rate
+                        trades_pnl.append(pnl)
+                        sl_hits += 1
+                        pos = 0
+                    # Case B: TP1 Hit (Nearest Resistance reached -> Book 75%)
+                    elif highs[i] >= tp1_price:
+                        pnl_75 = (pos_value * 0.75) * (tp1_price - entry_price) / entry_price - (pos_value * 0.75) * fee_rate
+                        trades_pnl.append(pnl_75)
+                        tp1_hits += 1
+                        # Shift Stop-Loss to Breakeven
+                        sl_price = entry_price
+                        stage = 2
 
-            if pos == 1:  # Long
-                highest_seen = max(highest_seen, highs[i])
-                # Breakeven Protection: Lock stop at entry if price reached threshold
-                curr_sl = entry_price if highest_seen >= entry_price * (1.0 + be_trigger) else entry_price * (1.0 - sl_pct)
-                if lows[i] <= curr_sl:
-                    ret = (curr_sl - entry_price) / entry_price
-                    pnl = pos_value * ret - round_trip_fee
-                    closed = True
-                elif highs[i] >= entry_price * (1.0 + tp_pct):
-                    pnl = pos_value * tp_pct - round_trip_fee
-                    closed = True
+                elif stage == 2:
+                    # Case C: Remaining 25% exits at Breakeven (Risk-Free)
+                    if lows[i] <= sl_price:
+                        pnl_25 = 0.0 - (pos_value * 0.25) * fee_rate
+                        trades_pnl.append(pnl_25)
+                        be_hits += 1
+                        pos = 0
+                    # Case D: Remaining 25% hits Next Pivot (TP2)
+                    elif highs[i] >= tp2_price:
+                        pnl_25 = (pos_value * 0.25) * (tp2_price - entry_price) / entry_price - (pos_value * 0.25) * fee_rate
+                        trades_pnl.append(pnl_25)
+                        tp2_hits += 1
+                        pos = 0
 
-            elif pos == -1:  # Short
-                lowest_seen = min(lowest_seen, lows[i])
-                curr_sl = entry_price if lowest_seen <= entry_price * (1.0 - be_trigger) else entry_price * (1.0 + sl_pct)
-                if highs[i] >= curr_sl:
-                    ret = (entry_price - curr_sl) / entry_price
-                    pnl = pos_value * ret - round_trip_fee
-                    closed = True
-                elif lows[i] <= entry_price * (1.0 - tp_pct):
-                    pnl = pos_value * tp_pct - round_trip_fee
-                    closed = True
-
-            if closed:
-                trades_pnl.append(pnl)
-                pos = 0
-
-        # Position Entry Check (ADX > 20 eliminates choppy fakeouts)
-        if pos == 0 and adx[i] > 20:
-            if pl_arr[i] and closes[i] > ema50[i] and direction in ["both", "long_only"]:
-                pos = 1
-                entry_price = closes[i]
-                highest_seen = entry_price
-            elif ph_arr[i] and closes[i] < ema50[i] and direction in ["both", "short_only"]:
-                pos = -1
-                entry_price = closes[i]
-                lowest_seen = entry_price
-
-    # Metrics
-    pnls = np.array(trades_pnl)
-    total_trades = len(pnls)
-    total_pnl = np.sum(pnls) if total_trades > 0 else 0.0
-    wins = np.sum(pnls > 0)
-    losses = np.sum(pnls <= 0)
-    win_rate = (wins / total_trades * 100) if total_trades > 0 else 0.0
-
-    gross_profit = pnls[pnls > 0].sum() if np.any(pnls > 0) else 0.0
-    gross_loss = np.abs(pnls[pnls < 0].sum()) if np.any(pnls < 0) else 1e-9
-    profit_factor = gross_profit / gross_loss
-
-    cum_pnl = np.cumsum(pnls) if total_trades > 0 else np.array([0])
-    cum_max = np.maximum.accumulate(cum_pnl)
-    max_dd_inr = np.min(cum_pnl - cum_max) if total_trades > 0 else 0.0
-
-    return {
-        "Total Trades": total_trades,
-        "Winning Trades": int(wins),
-        "Losing Trades": int(losses),
-        "Win Rate (%)": f"{win_rate:.2f}%",
-        "Total Net PnL (₹)": f"₹{total_pnl:,.2f}",
-        "Profit Factor": f"{profit_factor:.2f}",
-        "Max Drawdown (₹)": f"₹{abs(max_dd_inr):,.2f}",
-        "Margin Per Trade": f"₹{margin_inr}",
-        "Leverage": f"{leverage}x",
-        "Trade Sizing": f"₹{pos_value:,.2f}",
-        "Adaptive Risk:Reward": f"SL {sl_pct*100:.1f}% | TP {tp_pct*100:.1f}%",
-        "Risk Protection": "Breakeven Lock Enabled"
-    }
-
-
-# =====================================================================
-# 3. CLI RUNNER
-# =====================================================================
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Adaptive High Profit Crypto Backtester")
-    parser.add_argument("--coin", default=os.getenv("COIN", "ETH"))
-    parser.add_argument("--timeframe", default=os.getenv("TIMEFRAME", "1h"))
-    parser.add_argument("--period", default=os.getenv("PERIOD", "30d"))
-    parser.add_argument("--amount", type=float, default=float(os.getenv("TRADE_AMOUNT", "1000")))
-    parser.add_argument("--leverage", type=float, default=float(os.getenv("LEVERAGE", "10")))
-    parser.add_argument("--direction", default=os.getenv("DIRECTION", "both"))
-    parser.add_argument("--pivot_length", type=int, default=int(os.getenv("PIVOT_LENGTH", "3")))
-    args = parser.parse_args()
-
-    print("=" * 65)
-    print(f"💰 ADAPTIVE QUANT ENGINE | COIN: {args.coin.upper()} | TF: {args.timeframe} | PERIOD: {args.period}")
-    print(f"Margin: ₹{args.amount} | Leverage: {args.leverage}x | Mode: Adaptive Timeframe")
-    print("=" * 65)
-
-    df = fetch_crypto_data(coin=args.coin, timeframe=args.timeframe, period=args.period)
-    results = run_pivot_backtest(
-        df=df,
-        timeframe=args.timeframe,
-        length=args.pivot_length,
-        margin_inr=args.amount,
-        leverage=args.leverage,
-        direction=args.direction
-    )
-
-    for k, v in results.items():
-        print(f"{k:25}: {v}")
-    print("=" * 65)
+            elif pos == -1:  # SHORT TRADE
+                if stage == 1:
+                    # Full SL Hit
+                    if highs[i] >= sl_price:
+                        pnl = pos_value * (entry_price - sl_p
