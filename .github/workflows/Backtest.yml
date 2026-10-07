@@ -8,24 +8,25 @@ on:
       coin:
         description: 'Select Coin'
         required: true
-        default: 'SOL'
+        default: 'ETH'
         type: choice
         options:
+          - ETH
           - SOL
           - BTC
-          - ETH
           - DOGE
       period:
         description: 'Lookback Period'
         required: true
-        default: '180d'
+        default: '30d'
         type: choice
         options:
+          - '30d'
+          - '60d'
           - '180d'
           - '360d'
-          - '60d'
       timeframe:
-        description: 'Timeframe'
+        description: 'Timeframe (1h recommended)'
         required: true
         default: '1h'
         type: choice
@@ -44,10 +45,10 @@ on:
         type: choice
         options:
           - '10'
-          - '7'
           - '5'
+          - '3'
       pivot_length:
-        description: 'Fast Pivot Detection (3 recommended)'
+        description: 'Pivot Length'
         required: true
         default: '3'
 
@@ -71,8 +72,8 @@ jobs:
 
       - name: Run Backtester
         run: |
-          export COIN="${{ github.event.inputs.coin || 'SOL' }}"
-          export PERIOD="${{ github.event.inputs.period || '180d' }}"
+          export COIN="${{ github.event.inputs.coin || 'ETH' }}"
+          export PERIOD="${{ github.event.inputs.period || '30d' }}"
           export TIMEFRAME="${{ github.event.inputs.timeframe || '1h' }}"
           export TRADE_AMOUNT="${{ github.event.inputs.trade_amount || '1000' }}"
           export LEVERAGE="${{ github.event.inputs.leverage || '10' }}"
@@ -83,7 +84,7 @@ jobs:
       - name: Show Results in GitHub Summary
         if: always()
         run: |
-          echo "## 🚀 High Profit Backtest Summary (₹ INR)" >> $GITHUB_STEP_SUMMARY
+          echo "## 🚀 Adaptive Backtest Summary (₹ INR)" >> $GITHUB_STEP_SUMMARY
           echo '```text' >> $GITHUB_STEP_SUMMARY
           cat output.log >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
