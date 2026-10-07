@@ -5,9 +5,9 @@ import numpy as np
 import pandas as pd
 
 # =====================================================================
-# 1. DATA FETCHING (Supports 60d, 180d, 360d in INR)
+# 1. DATA FETCHING (Supports 30d, 60d, 180d, 360d in INR)
 # =====================================================================
-def fetch_crypto_data(coin="SOL", timeframe="1h", period="180d"):
+def fetch_crypto_data(coin="ETH", timeframe="1h", period="30d"):
     symbol = f"{coin.upper().replace('-INR', '')}-INR"
     print(f"📡 Fetching data for {symbol} | Timeframe: {timeframe} | Period: {period}...")
 
@@ -26,13 +26,13 @@ def fetch_crypto_data(coin="SOL", timeframe="1h", period="180d"):
     except Exception as e:
         print(f"⚠️ Live fetch notice: {e}")
 
-    # Fallback simulation
+    # Fallback simulation if offline
     if df is None or len(df) < 50:
         print("⚠️ Generating fallback simulation...")
         np.random.seed(42)
         n = 3000
         base = 5800000.0 if "BTC" in symbol else (280000.0 if "ETH" in symbol else 12500.0)
-        ret = np.random.normal(0.0003, 0.015, n)
+        ret = np.random.normal(0.0002, 0.015, n)
         prices = base * np.exp(np.cumsum(ret))
         highs = prices * (1 + np.abs(np.random.normal(0, 0.006, n)))
         lows = prices * (1 - np.abs(np.random.normal(0, 0.006, n)))
@@ -46,16 +46,30 @@ def fetch_crypto_data(coin="SOL", timeframe="1h", period="180d"):
 
 
 # =====================================================================
-# 2. QUANT PROFIT ENGINE (ADX Filter + Fast Pivot + 1:3 R:R)
+# 2. ADAPTIVE QUANT ENGINE (Auto-Scales SL/TP by Timeframe)
 # =====================================================================
-def run_pivot_backtest(df, length=3, margin_inr=1000.0, leverage=10.0, 
-                       direction="both", sl_pct=0.02, tp_pct=0.06, fee_pct=0.0005):
+def run_pivot_backtest(df, timeframe="1h", length=3, margin_inr=1000.0, 
+                       leverage=10.0, direction="both", fee_pct=0.0005):
     n = len(df)
     highs = df['High'].values
     lows = df['Low'].values
     closes = df['Close'].values
 
-    # 1. Calculate True Range & ADX (14) for Chop/Range Filtering
+    # Auto-adjust SL & TP to be realistic for each timeframe
+    if timeframe == "15m":
+        sl_pct = 0.012  # 1.2% SL
+        tp_pct = 0.025  # 2.5% TP (Achievable in 15m)
+        be_trigger = 0.015  # Breakeven lock at +1.5%
+    elif timeframe == "1h":
+        sl_pct = 0.020  # 2.0% SL
+        tp_pct = 0.050  # 5.0% TP
+        be_trigger = 0.025  # Breakeven lock at +2.5%
+    else:
+        sl_pct = 0.030
+        tp_pct = 0.070
+        be_trigger = 0.035
+
+    # 1. ADX (14) for Chop/Range Elimination
     tr1 = highs[1:] - lows[1:]
     tr2 = np.abs(highs[1:] - closes[:-1])
     tr3 = np.abs(lows[1:] - closes[:-1])
@@ -73,7 +87,7 @@ def run_pivot_backtest(df, length=3, margin_inr=1000.0, leverage=10.0,
     adx = np.zeros(n)
     adx[1:] = dx.rolling(14, min_periods=1).mean().values
 
-    # 2. 50 EMA for Macro Trend
+    # 2. 50 EMA for Trend Direction
     ema50 = pd.Series(closes).ewm(span=50, adjust=False).mean().values
 
     # 3. Fast Pivot Detection
@@ -87,30 +101,40 @@ def run_pivot_backtest(df, length=3, margin_inr=1000.0, leverage=10.0,
         if (lows[i - length] == np.min(wl)) and (np.sum(wl == lows[i - length]) == 1):
             pl_arr[i] = True
 
-    # 4. Trade Execution
+    # 4. Trade Execution with Breakeven Protection
     pos = 0
     entry_price = 0.0
+    highest_seen = 0.0
+    lowest_seen = 1e12
     trades_pnl = []
 
-    pos_value = margin_inr * leverage  # ₹10,000 position
-    round_trip_fee = pos_value * fee_pct * 2  # ₹10 fee
+    pos_value = margin_inr * leverage
+    round_trip_fee = pos_value * fee_pct * 2
 
     for i in range(25, n):
-        # Position Exit Check (SL / TP)
+        # Position Exit Check
         if pos != 0:
             closed = False
             pnl = 0.0
 
             if pos == 1:  # Long
-                if lows[i] <= entry_price * (1.0 - sl_pct):
-                    pnl = pos_value * (-sl_pct) - round_trip_fee
+                highest_seen = max(highest_seen, highs[i])
+                # Breakeven Protection: Lock stop at entry if price reached threshold
+                curr_sl = entry_price if highest_seen >= entry_price * (1.0 + be_trigger) else entry_price * (1.0 - sl_pct)
+                if lows[i] <= curr_sl:
+                    ret = (curr_sl - entry_price) / entry_price
+                    pnl = pos_value * ret - round_trip_fee
                     closed = True
                 elif highs[i] >= entry_price * (1.0 + tp_pct):
                     pnl = pos_value * tp_pct - round_trip_fee
                     closed = True
+
             elif pos == -1:  # Short
-                if highs[i] >= entry_price * (1.0 + sl_pct):
-                    pnl = pos_value * (-sl_pct) - round_trip_fee
+                lowest_seen = min(lowest_seen, lows[i])
+                curr_sl = entry_price if lowest_seen <= entry_price * (1.0 - be_trigger) else entry_price * (1.0 + sl_pct)
+                if highs[i] >= curr_sl:
+                    ret = (entry_price - curr_sl) / entry_price
+                    pnl = pos_value * ret - round_trip_fee
                     closed = True
                 elif lows[i] <= entry_price * (1.0 - tp_pct):
                     pnl = pos_value * tp_pct - round_trip_fee
@@ -120,16 +144,16 @@ def run_pivot_backtest(df, length=3, margin_inr=1000.0, leverage=10.0,
                 trades_pnl.append(pnl)
                 pos = 0
 
-        # Position Entry Check (Only when ADX > 20 indicates strong trend)
+        # Position Entry Check (ADX > 20 eliminates choppy fakeouts)
         if pos == 0 and adx[i] > 20:
-            # Long: Fast Pivot Low + Uptrend (Price > 50 EMA)
             if pl_arr[i] and closes[i] > ema50[i] and direction in ["both", "long_only"]:
                 pos = 1
                 entry_price = closes[i]
-            # Short: Fast Pivot High + Downtrend (Price < 50 EMA)
+                highest_seen = entry_price
             elif ph_arr[i] and closes[i] < ema50[i] and direction in ["both", "short_only"]:
                 pos = -1
                 entry_price = closes[i]
+                lowest_seen = entry_price
 
     # Metrics
     pnls = np.array(trades_pnl)
@@ -158,8 +182,8 @@ def run_pivot_backtest(df, length=3, margin_inr=1000.0, leverage=10.0,
         "Margin Per Trade": f"₹{margin_inr}",
         "Leverage": f"{leverage}x",
         "Trade Sizing": f"₹{pos_value:,.2f}",
-        "Risk:Reward": f"SL {sl_pct*100}% | TP {tp_pct*100}% (1:3 Ratio)",
-        "Trend Filter": "ADX > 20 + 50 EMA (Chop Elimination)"
+        "Adaptive Risk:Reward": f"SL {sl_pct*100:.1f}% | TP {tp_pct*100:.1f}%",
+        "Risk Protection": "Breakeven Lock Enabled"
     }
 
 
@@ -167,10 +191,10 @@ def run_pivot_backtest(df, length=3, margin_inr=1000.0, leverage=10.0,
 # 3. CLI RUNNER
 # =====================================================================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="High Profit Crypto Backtester")
-    parser.add_argument("--coin", default=os.getenv("COIN", "SOL"))
+    parser = argparse.ArgumentParser(description="Adaptive High Profit Crypto Backtester")
+    parser.add_argument("--coin", default=os.getenv("COIN", "ETH"))
     parser.add_argument("--timeframe", default=os.getenv("TIMEFRAME", "1h"))
-    parser.add_argument("--period", default=os.getenv("PERIOD", "180d"))
+    parser.add_argument("--period", default=os.getenv("PERIOD", "30d"))
     parser.add_argument("--amount", type=float, default=float(os.getenv("TRADE_AMOUNT", "1000")))
     parser.add_argument("--leverage", type=float, default=float(os.getenv("LEVERAGE", "10")))
     parser.add_argument("--direction", default=os.getenv("DIRECTION", "both"))
@@ -178,13 +202,14 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     print("=" * 65)
-    print(f"💰 HIGH PROFIT QUANT ENGINE | COIN: {args.coin.upper()} | TF: {args.timeframe} | PERIOD: {args.period}")
-    print(f"Margin: ₹{args.amount} | Leverage: {args.leverage}x | Target: 1:3 R:R")
+    print(f"💰 ADAPTIVE QUANT ENGINE | COIN: {args.coin.upper()} | TF: {args.timeframe} | PERIOD: {args.period}")
+    print(f"Margin: ₹{args.amount} | Leverage: {args.leverage}x | Mode: Adaptive Timeframe")
     print("=" * 65)
 
     df = fetch_crypto_data(coin=args.coin, timeframe=args.timeframe, period=args.period)
     results = run_pivot_backtest(
         df=df,
+        timeframe=args.timeframe,
         length=args.pivot_length,
         margin_inr=args.amount,
         leverage=args.leverage,
