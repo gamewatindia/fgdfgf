@@ -5,9 +5,9 @@ import numpy as np
 import pandas as pd
 
 # =====================================================================
-# 1. DATA FETCHING (Supports Indian INR pairs)
+# 1. DATA FETCHING (INR Pairs)
 # =====================================================================
-def fetch_crypto_data(coin="BTC", timeframe="1h", period="60d"):
+def fetch_crypto_data(coin="SOL", timeframe="1h", period="60d"):
     symbol = f"{coin.upper().replace('-INR', '')}-INR"
     print(f"📡 Fetching data for {symbol} | Timeframe: {timeframe} | Period: {period}...")
 
@@ -30,9 +30,9 @@ def fetch_crypto_data(coin="BTC", timeframe="1h", period="60d"):
     if df is None or len(df) < 50:
         print("⚠️ Generating fallback data...")
         np.random.seed(42)
-        n = 1500
+        n = 1424
         base = 5800000.0 if "BTC" in symbol else (280000.0 if "ETH" in symbol else 12500.0)
-        ret = np.random.normal(0.0003, 0.015, n)
+        ret = np.random.normal(0.0002, 0.015, n)
         prices = base * np.exp(np.cumsum(ret))
         highs = prices * (1 + np.abs(np.random.normal(0, 0.006, n)))
         lows = prices * (1 - np.abs(np.random.normal(0, 0.006, n)))
@@ -46,148 +46,130 @@ def fetch_crypto_data(coin="BTC", timeframe="1h", period="60d"):
 
 
 # =====================================================================
-# 2. ADVANCED PIVOT ENGINE WITH DYNAMIC ATR TRAILING STOP
+# 2. FIXED STRATEGY ENGINE (Zero Over-trading + 1:2.5 Risk-Reward)
 # =====================================================================
-def run_pivot_backtest(df, length=15, strategy_type="breakout", 
+def run_pivot_backtest(df, length=10, strategy_type="reversal", 
                        margin_inr=1000.0, leverage=5.0, direction="both",
-                       atr_sl_mult=1.8, atr_trail_mult=2.2, fee_pct=0.0005):
+                       sl_pct=0.02, tp_pct=0.05, fee_pct=0.0005):
     """
-    Upgraded with:
-    1. Dynamic ATR Volatility Stop (Coin ke wicks ke hisaab se adjust hota hai)
-    2. ATR Trailing Stop (Bade 10%-20% moves ko poora capture karta hai)
-    3. 200 EMA Trend Alignment
+    Fixed Model:
+    - SL: 2.0%
+    - TP: 5.0% (1:2.5 Risk-Reward)
+    - 50 EMA Trend Filter: Only buys dips in uptrend, only sells peaks in downtrend
+    - Over-trading loop strictly eliminated
     """
     n = len(df)
     highs = df['High'].values
     lows = df['Low'].values
     closes = df['Close'].values
 
-    # Calculate ATR (14) for Dynamic Risk
-    tr1 = highs[1:] - lows[1:]
-    tr2 = np.abs(highs[1:] - closes[:-1])
-    tr3 = np.abs(lows[1:] - closes[:-1])
-    tr = np.maximum(tr1, np.maximum(tr2, tr3))
-    atr = np.zeros(n)
-    atr[1:] = pd.Series(tr).rolling(14, min_periods=1).mean().values
+    # 50 EMA for Short-term Trend Direction
+    ema50 = df['Close'].ewm(span=50, adjust=False).mean().values
 
-    # 200 EMA for Macro Trend
-    ema200 = df['Close'].ewm(span=200, adjust=False).mean().values
+    # Pivot Detection
+    ph_arr = np.zeros(n, dtype=bool)
+    pl_arr = np.zeros(n, dtype=bool)
 
     max_val = 0.0
     min_val = 1e12
     follow_max = 0.0
     follow_min = 1e12
     os_state = 0
-
-    active_ghost_h = np.nan
-    active_ghost_l = np.nan
-    signals = np.zeros(n)
+    active_gh = np.nan
+    active_gl = np.nan
 
     for i in range(2 * length, n):
-        # Pivot High
+        # Pivot High Confirmation
         w_h = highs[i - 2 * length : i + 1]
         val_h = highs[i - length]
-        is_ph = (val_h == np.max(w_h)) and (np.sum(w_h == val_h) == 1)
+        if (val_h == np.max(w_h)) and (np.sum(w_h == val_h) == 1):
+            ph_arr[i] = True
 
-        # Pivot Low
+        # Pivot Low Confirmation
         w_l = lows[i - 2 * length : i + 1]
         val_l = lows[i - length]
-        is_pl = (val_l == np.min(w_l)) and (np.sum(w_l == val_l) == 1)
+        if (val_l == np.min(w_l)) and (np.sum(w_l == val_l) == 1):
+            pl_arr[i] = True
 
+        # Track ghost levels
         curr_h, curr_l = highs[i - length], lows[i - length]
         prev_max, prev_min = max_val, min_val
         max_val = max(curr_h, max_val)
         min_val = min(curr_l, min_val)
         follow_max = max(curr_h, follow_max)
         follow_min = min(curr_l, follow_min)
-
-        if max_val > prev_max:
-            follow_min = curr_l
-        if min_val < prev_min:
-            follow_max = curr_h
-
+        if max_val > prev_max: follow_min = curr_l
+        if min_val < prev_min: follow_max = curr_h
         prev_os = os_state
+        if ph_arr[i]:
+            if prev_os == 1: active_gl = min_val
+            elif curr_h < max_val: active_gh = max_val; active_gl = follow_min
+            os_state = 1; max_val = curr_h; min_val = curr_h
+        if pl_arr[i]:
+            if prev_os == 0: active_gh = max_val
+            elif curr_l > min_val: active_gh = follow_max; active_gl = min_val
+            os_state = 0; max_val = curr_l; min_val = curr_l
 
-        if is_ph:
-            if prev_os == 1:
-                active_ghost_l = min_val
-            elif curr_h < max_val:
-                active_ghost_h = max_val
-                active_ghost_l = follow_min
-            os_state = 1
-            max_val = curr_h
-            min_val = curr_h
-
-        if is_pl:
-            if prev_os == 0:
-                active_ghost_h = max_val
-            elif curr_l > min_val:
-                active_ghost_h = follow_max
-                active_ghost_l = min_val
-            os_state = 0
-            max_val = curr_l
-            min_val = curr_l
-
-        trend_up = closes[i] > ema200[i]
-        trend_down = closes[i] < ema200[i]
-
-        sig = 0
-        if strategy_type == "breakout":
-            if not np.isnan(active_ghost_h) and closes[i] > active_ghost_h and trend_up and direction in ["both", "long_only"]:
-                sig = 1
-            elif not np.isnan(active_ghost_l) and closes[i] < active_ghost_l and trend_down and direction in ["both", "short_only"]:
-                sig = -1
-        elif strategy_type == "reversal":
-            if is_pl and trend_up and direction in ["both", "long_only"]:
-                sig = 1
-            elif is_ph and trend_down and direction in ["both", "short_only"]:
-                sig = -1
-
-        signals[i] = sig
-
-    # 3. Execution with Dynamic ATR Trailing Stop
+    # Trade Execution
     pos = 0
     entry_price = 0.0
-    highest_seen = 0.0
-    lowest_seen = 1e12
     trades_pnl = []
-
+    
     pos_value = margin_inr * leverage
     round_trip_fee = pos_value * fee_pct * 2
 
-    for i in range(1, n):
+    for i in range(2 * length, n):
+        # Check SL / TP
         if pos != 0:
             closed = False
-            raw_pnl = 0.0
+            pnl = 0.0
 
-            if pos == 1:  # LONG
-                highest_seen = max(highest_seen, highs[i])
-                # Dynamic Trailing Stop
-                current_sl = max(entry_price - (atr_sl_mult * atr[i]), highest_seen - (atr_trail_mult * atr[i]))
-                if lows[i] <= current_sl:
-                    raw_ret = (current_sl - entry_price) / entry_price
-                    raw_ret = max(raw_ret, -1.0 / leverage)
-                    trades_pnl.append(pos_value * raw_ret - round_trip_fee)
-                    pos = 0
+            if pos == 1:  # Long
+                if lows[i] <= entry_price * (1.0 - sl_pct):
+                    pnl = pos_value * (-sl_pct) - round_trip_fee
+                    closed = True
+                elif highs[i] >= entry_price * (1.0 + tp_pct):
+                    pnl = pos_value * tp_pct - round_trip_fee
+                    closed = True
+            elif pos == -1:  # Short
+                if highs[i] >= entry_price * (1.0 + sl_pct):
+                    pnl = pos_value * (-sl_pct) - round_trip_fee
+                    closed = True
+                elif lows[i] <= entry_price * (1.0 - tp_pct):
+                    pnl = pos_value * tp_pct - round_trip_fee
+                    closed = True
 
-            elif pos == -1:  # SHORT
-                lowest_seen = min(lowest_seen, lows[i])
-                # Dynamic Trailing Stop
-                current_sl = min(entry_price + (atr_sl_mult * atr[i]), lowest_seen + (atr_trail_mult * atr[i]))
-                if highs[i] >= current_sl:
-                    raw_ret = (entry_price - current_sl) / entry_price
-                    raw_ret = max(raw_ret, -1.0 / leverage)
-                    trades_pnl.append(pos_value * raw_ret - round_trip_fee)
-                    pos = 0
+            if closed:
+                trades_pnl.append(pnl)
+                pos = 0
 
-        # New entry
-        if signals[i] != 0 and pos == 0:
-            pos = int(signals[i])
-            entry_price = closes[i]
-            highest_seen = entry_price
-            lowest_seen = entry_price
+        # Check for Entry ONLY when not currently in position
+        if pos == 0:
+            trend_up = closes[i] > ema50[i]
+            trend_down = closes[i] < ema50[i]
 
-    # Results Calculation
+            if strategy_type == "reversal":
+                # Buy Dip in Uptrend
+                if pl_arr[i] and trend_up and direction in ["both", "long_only"]:
+                    pos = 1
+                    entry_price = closes[i]
+                # Sell Rally in Downtrend
+                elif ph_arr[i] and trend_down and direction in ["both", "short_only"]:
+                    pos = -1
+                    entry_price = closes[i]
+
+            elif strategy_type == "breakout":
+                # Strict 1-time Crossover (No repeating loops)
+                if not np.isnan(active_gh) and closes[i] > active_gh and closes[i-1] <= active_gh and trend_up:
+                    pos = 1
+                    entry_price = closes[i]
+                    active_gh = np.nan  # Level consumed!
+                elif not np.isnan(active_gl) and closes[i] < active_gl and closes[i-1] >= active_gl and trend_down:
+                    pos = -1
+                    entry_price = closes[i]
+                    active_gl = np.nan  # Level consumed!
+
+    # Metrics
     pnls = np.array(trades_pnl)
     total_trades = len(pnls)
     total_pnl = np.sum(pnls) if total_trades > 0 else 0.0
@@ -214,26 +196,26 @@ def run_pivot_backtest(df, length=15, strategy_type="breakout",
         "Margin Per Trade": f"₹{margin_inr}",
         "Leverage": f"{leverage}x",
         "Trade Sizing": f"₹{pos_value:,.2f}",
-        "Exit Model": "Dynamic ATR Trailing Stop (Rides Full Trend)"
+        "Risk:Reward": f"SL {sl_pct*100}% | TP {tp_pct*100}% (1:2.5)"
     }
 
 
 # =====================================================================
-# 4. RUNNER
+# 3. RUNNER
 # =====================================================================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Crypto Pivot Backtest with ATR Trailing Stop")
+    parser = argparse.ArgumentParser(description="Crypto Pivot Backtest Fixed")
     parser.add_argument("--coin", default=os.getenv("COIN", "SOL"))
     parser.add_argument("--timeframe", default=os.getenv("TIMEFRAME", "1h"))
     parser.add_argument("--amount", type=float, default=float(os.getenv("TRADE_AMOUNT", "1000")))
     parser.add_argument("--leverage", type=float, default=float(os.getenv("LEVERAGE", "5")))
     parser.add_argument("--direction", default=os.getenv("DIRECTION", "both"))
-    parser.add_argument("--strategy", default=os.getenv("STRATEGY_TYPE", "breakout"))
-    parser.add_argument("--pivot_length", type=int, default=int(os.getenv("PIVOT_LENGTH", "15")))
+    parser.add_argument("--strategy", default=os.getenv("STRATEGY_TYPE", "reversal"))
+    parser.add_argument("--pivot_length", type=int, default=int(os.getenv("PIVOT_LENGTH", "10")))
     args = parser.parse_args()
 
     print("=" * 65)
-    print(f"🚀 UPGRADED ATR TRAILING BACKTEST | COIN: {args.coin.upper()} | TF: {args.timeframe}")
+    print(f"🎯 OPTIMIZED BACKTEST | COIN: {args.coin.upper()} | TF: {args.timeframe}")
     print(f"Margin: ₹{args.amount} | Leverage: {args.leverage}x | Mode: {args.strategy.upper()}")
     print("=" * 65)
 
