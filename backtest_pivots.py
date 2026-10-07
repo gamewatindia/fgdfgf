@@ -50,14 +50,6 @@ def fetch_crypto_data(coin="ETH", timeframe="1h", period="30d"):
 # =====================================================================
 def run_pivot_strategy(df, length=3, margin_inr=1000.0, leverage=5.0, 
                        direction="both", fee_pct=0.0005):
-    """
-    Rules:
-    - Entry: Pivot confirmation
-    - SL: Thode niche of Pivot Point (0.3% buffer)
-    - TP1: 75% Qty booked at Nearest Resistance / Support
-    - SL to Breakeven once TP1 is hit
-    - TP2: 25% Qty targets Next Pivot Extension
-    """
     n = len(df)
     highs = df['High'].values
     lows = df['Low'].values
@@ -93,7 +85,7 @@ def run_pivot_strategy(df, length=3, margin_inr=1000.0, leverage=5.0,
     sl_price = 0.0
     tp1_price = 0.0
     tp2_price = 0.0
-    stage = 0  # 1 = Initial (100%), 2 = TP1 Hit (25% remaining at Breakeven)
+    stage = 0  # 1 = 100% active, 2 = 75% booked & Breakeven active
 
     trades_pnl = []
     trade_cycles = 0
@@ -113,13 +105,13 @@ def run_pivot_strategy(df, length=3, margin_inr=1000.0, leverage=5.0,
         if pos != 0:
             if pos == 1:  # LONG TRADE
                 if stage == 1:
-                    # Case A: Full SL Hit (Pivot low breached)
+                    # Full SL Hit (Pivot low breached)
                     if lows[i] <= sl_price:
                         pnl = pos_value * (sl_price - entry_price) / entry_price - pos_value * fee_rate
                         trades_pnl.append(pnl)
                         sl_hits += 1
                         pos = 0
-                    # Case B: TP1 Hit (Nearest Resistance reached -> Book 75%)
+                    # TP1 Hit (Nearest Resistance reached -> Book 75%)
                     elif highs[i] >= tp1_price:
                         pnl_75 = (pos_value * 0.75) * (tp1_price - entry_price) / entry_price - (pos_value * 0.75) * fee_rate
                         trades_pnl.append(pnl_75)
@@ -129,13 +121,13 @@ def run_pivot_strategy(df, length=3, margin_inr=1000.0, leverage=5.0,
                         stage = 2
 
                 elif stage == 2:
-                    # Case C: Remaining 25% exits at Breakeven (Risk-Free)
+                    # Remaining 25% exits at Breakeven (Zero Loss)
                     if lows[i] <= sl_price:
                         pnl_25 = 0.0 - (pos_value * 0.25) * fee_rate
                         trades_pnl.append(pnl_25)
                         be_hits += 1
                         pos = 0
-                    # Case D: Remaining 25% hits Next Pivot (TP2)
+                    # Remaining 25% hits Next Pivot (TP2)
                     elif highs[i] >= tp2_price:
                         pnl_25 = (pos_value * 0.25) * (tp2_price - entry_price) / entry_price - (pos_value * 0.25) * fee_rate
                         trades_pnl.append(pnl_25)
@@ -144,6 +136,138 @@ def run_pivot_strategy(df, length=3, margin_inr=1000.0, leverage=5.0,
 
             elif pos == -1:  # SHORT TRADE
                 if stage == 1:
-                    # Full SL Hit
+                    # Full SL Hit (Pivot high breached)
                     if highs[i] >= sl_price:
-                        pnl = pos_value * (entry_price - sl_p
+                        pnl = pos_value * (entry_price - sl_price) / entry_price - pos_value * fee_rate
+                        trades_pnl.append(pnl)
+                        sl_hits += 1
+                        pos = 0
+                    # TP1 Hit (Nearest Support reached -> Book 75%)
+                    elif lows[i] <= tp1_price:
+                        pnl_75 = (pos_value * 0.75) * (entry_price - tp1_price) / entry_price - (pos_value * 0.75) * fee_rate
+                        trades_pnl.append(pnl_75)
+                        tp1_hits += 1
+                        # Shift Stop-Loss to Breakeven
+                        sl_price = entry_price
+                        stage = 2
+
+                elif stage == 2:
+                    # Remaining 25% exits at Breakeven (Zero Loss)
+                    if highs[i] >= sl_price:
+                        pnl_25 = 0.0 - (pos_value * 0.25) * fee_rate
+                        trades_pnl.append(pnl_25)
+                        be_hits += 1
+                        pos = 0
+                    # Remaining 25% hits Next Pivot (TP2)
+                    elif lows[i] <= tp2_price:
+                        pnl_25 = (pos_value * 0.25) * (entry_price - tp2_price) / entry_price - (pos_value * 0.25) * fee_rate
+                        trades_pnl.append(pnl_25)
+                        tp2_hits += 1
+                        pos = 0
+
+        # ----------------- Check For New Entry -----------------
+        if pos == 0:
+            # Long: Pivot Low Confirmed
+            if pl[i] and closes[i] > ema50[i] and direction in ["both", "long_only"]:
+                pivot_low = pl_val[i]
+                entry = closes[i]
+                sl = pivot_low * 0.997  # SL: Just 0.3% below pivot point
+                risk = entry - sl
+                
+                if risk > 0 and (risk / entry) < 0.05:
+                    # TP1: Nearest Resistance (Last Pivot High)
+                    tp1 = last_resistance if (not np.isnan(last_resistance) and last_resistance > entry * 1.01) else entry + 1.8 * risk
+                    # TP2: Next Pivot Extension
+                    tp2 = tp1 + 1.5 * risk
+
+                    pos = 1
+                    entry_price = entry
+                    sl_price = sl
+                    tp1_price = tp1
+                    tp2_price = tp2
+                    stage = 1
+                    trade_cycles += 1
+
+            # Short: Pivot High Confirmed
+            elif ph[i] and closes[i] < ema50[i] and direction in ["both", "short_only"]:
+                pivot_high = ph_val[i]
+                entry = closes[i]
+                sl = pivot_high * 1.003  # SL: Just 0.3% above pivot point
+                risk = sl - entry
+                
+                if risk > 0 and (risk / entry) < 0.05:
+                    # TP1: Nearest Support (Last Pivot Low)
+                    tp1 = last_support if (not np.isnan(last_support) and last_support < entry * 0.99) else entry - 1.8 * risk
+                    # TP2: Next Pivot Extension
+                    tp2 = tp1 - 1.5 * risk
+
+                    pos = -1
+                    entry_price = entry
+                    sl_price = sl
+                    tp1_price = tp1
+                    tp2_price = tp2
+                    stage = 1
+                    trade_cycles += 1
+
+    # Metrics
+    pnls = np.array(trades_pnl)
+    total_pnl = np.sum(pnls) if len(pnls) > 0 else 0.0
+    wins = np.sum(pnls > 0)
+    losses = np.sum(pnls <= 0)
+    win_rate = (wins / len(pnls) * 100) if len(pnls) > 0 else 0.0
+
+    gross_profit = pnls[pnls > 0].sum() if np.any(pnls > 0) else 0.0
+    gross_loss = np.abs(pnls[pnls < 0].sum()) if np.any(pnls < 0) else 1e-9
+    profit_factor = gross_profit / gross_loss
+
+    cum_pnl = np.cumsum(pnls) if len(pnls) > 0 else np.array([0])
+    cum_max = np.maximum.accumulate(cum_pnl)
+    max_dd_inr = np.min(cum_pnl - cum_max) if len(pnls) > 0 else 0.0
+
+    return {
+        "Total Trades Started": trade_cycles,
+        "TP1 Hits (75% Profit Booked)": tp1_hits,
+        "TP2 Hits (25% Runner Target)": tp2_hits,
+        "Breakeven Exits (Zero Loss)": be_hits,
+        "Full Stop-Loss Hits": sl_hits,
+        "Win Rate (%)": f"{win_rate:.2f}%",
+        "Total Net PnL (₹)": f"₹{total_pnl:,.2f}",
+        "Profit Factor": f"{profit_factor:.2f}",
+        "Max Drawdown (₹)": f"₹{abs(max_dd_inr):,.2f}",
+        "Margin Per Trade": f"₹{margin_inr}",
+        "Leverage": f"{leverage}x",
+        "Effective Trade Size": f"₹{pos_value:,.2f}"
+    }
+
+
+# =====================================================================
+# 3. RUNNER
+# =====================================================================
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Simple Pivot Partial Booking System")
+    parser.add_argument("--coin", default=os.getenv("COIN", "ETH"))
+    parser.add_argument("--timeframe", default=os.getenv("TIMEFRAME", "1h"))
+    parser.add_argument("--period", default=os.getenv("PERIOD", "30d"))
+    parser.add_argument("--amount", type=float, default=float(os.getenv("TRADE_AMOUNT", "1000")))
+    parser.add_argument("--leverage", type=float, default=float(os.getenv("LEVERAGE", "5")))
+    parser.add_argument("--direction", default=os.getenv("DIRECTION", "both"))
+    parser.add_argument("--pivot_length", type=int, default=int(os.getenv("PIVOT_LENGTH", "3")))
+    args = parser.parse_args()
+
+    print("=" * 65)
+    print(f"🎯 PIVOT STRATEGY (75% TP1 + Breakeven Runner) | {args.coin.upper()} | {args.timeframe}")
+    print(f"Period: {args.period} | Margin: ₹{args.amount} | Leverage: {args.leverage}x")
+    print("=" * 65)
+
+    df = fetch_crypto_data(coin=args.coin, timeframe=args.timeframe, period=args.period)
+    results = run_pivot_strategy(
+        df=df,
+        length=args.pivot_length,
+        margin_inr=args.amount,
+        leverage=args.leverage,
+        direction=args.direction
+    )
+
+    for k, v in results.items():
+        print(f"{k:32}: {v}")
+    print("=" * 65)
