@@ -12,15 +12,21 @@ MODES (--mode)
                        its take-profit (--tp %). CROSS margin: all positions share one account
                        (--balance). If account equity can't cover the open losses, the WHOLE account
                        is liquidated.
+                       --max_open N : at most N positions at the same time (extra signals skipped).
+                       --min_open N : keep at least N positions running (a take-profit that would drop
+                                      the count below N is postponed until a new position opens).
 
 Rs MARGIN per trade x LEV leverage. Fee on full position size. Liquidation (isolated, reverse modes):
 ~ 1/LEV - 0.5% adverse move = full margin lost. Optional --sl / --tp in % of PRICE
 (10x: 5% price = 50% on margin).
 
-Outputs: backtest_all_trades.csv, backtest_summary.csv, equity_all.png
-Run: python pivot_backtest.py --pair BTCUSDT --days 30 --mode hold_long --tp 5 --balance 10000
+Every output file name + every row carries run_id / coin / pair / exchange so uploads are self-explaining.
+Outputs (folder results/): <run_id>_summary.csv, _trades.csv, _pivots.csv, _equity.png, <run_id>.xlsx
+Run: python pivot_backtest.py --pair BTCUSDT --days 30 --mode hold_long --tp 5 --balance 10000 --max_open 3
+Pair can carry a preferred exchange:  --pair BRUSDT@mexc
 """
 import argparse, os, time
+from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 
@@ -39,6 +45,7 @@ EXCHANGES = {
     "MARK_PRICE": ["gateio", "bitget", "okx", "bybit", "binanceusdm", "kucoinfutures"],
     "INDEX_PRICE": ["gateio", "bitget", "okx", "bybit", "binanceusdm"],
 }
+HOLD_ONLY_COLS = ["account_liq", "min_equity", "final_equity", "skipped", "skipped_cap", "peak_open"]
 
 
 def norm_pair(p):
@@ -51,8 +58,8 @@ def norm_pair(p):
 
 
 def fetch(pair, tf, days, warmup, price, first=""):
-    """Tries exchanges in order. Prefers one that has the FULL requested history (days);
-    if none does, uses the one with the most history and prints a warning."""
+    """Returns (df, info). Tries exchanges in order. Prefers one with the FULL requested history;
+    if none has it, uses the one with the most history and prints a warning."""
     import ccxt
     errs, best = [], None
     order = ([first] if first else []) + [e for e in EXCHANGES[price] if e != first]
@@ -87,19 +94,21 @@ def fetch(pair, tf, days, warmup, price, first=""):
             df = df.drop_duplicates("time").sort_values("time").reset_index(drop=True)
             span = (df["time"].iloc[-1] - df["time"].iloc[0]).total_seconds() / 86400
             covered = span - warmup * tf_ms / 86400000      # days of history usable for trading
+            info = dict(exchange=name, symbol=sym, candles=len(df), days_covered=round(covered),
+                        data_from=str(df["time"].iloc[0]), data_to=str(df["time"].iloc[-1]))
             if covered >= days * 0.97:
                 print(f"[{tf}] data: {name} {sym} {price} ({len(df)} candles, {covered:.0f} days)")
-                return df
+                return df, info
             errs.append(f"{name}: only {covered:.0f} of {days} days")
             if best is None or covered > best[0]:
-                best = (covered, name, sym, df)
+                best = (covered, name, sym, df, info)
         except Exception as e:
             errs.append(f"{name}: {str(e)[:60]}")
     if best:
-        covered, name, sym, df = best
+        covered, name, sym, df, info = best
         print(f"[{tf}] WARNING: no exchange had {days} days. Using {name} {sym}: only {covered:.0f} days "
               f"({len(df)} candles). Others: {' | '.join(errs)}")
-        return df
+        return df, info
     raise RuntimeError(" | ".join(errs))
 
 
@@ -193,14 +202,17 @@ def reverse_backtest(df, length, days, tf, at_pivot):
     return pd.DataFrame(trades), len(sig), {}
 
 
-def hold_backtest(df, length, days, tf, side, balance):
-    """Cross margin, no SL, opposite signals ignored, every position held until TP."""
+def hold_backtest(df, length, days, tf, side, balance, min_open=0, max_open=0):
+    """Cross margin, no SL, opposite signals ignored, every position held until TP.
+    max_open: cap on simultaneous positions (0 = no cap).
+    min_open: keep at least this many running; a TP that would go below it is postponed."""
     high, low, close, t = df["high"].values, df["low"].values, df["close"].values, df["time"]
     sig = get_signals(df, length, days, False)
     notional = MARGIN * LEV
     fee_side = notional * FEE_PCT / 100
     tp = TP / 100
     cash, opn, trades, skipped, dead, min_eq = balance, [], [], 0, False, balance
+    skipped_cap, peak = 0, 0
 
     def rec(p, px, tm, status):
         g = notional * p["d"] * (px / p["epx"] - 1)
@@ -227,13 +239,23 @@ def hold_backtest(df, length, days, tf, side, balance):
                 opn, cash, dead = [], 0.0, True
                 break
             for p in list(opn):
-                if p["fav"] >= tp:
-                    g = rec(p, p["epx"] * (1 + p["d"] * tp), t.iloc[j], "TARGET")
+                hit = p["fav"] >= tp
+                if hit or p.get("due"):
+                    if len(opn) <= min_open:         # keep the minimum number of trades running
+                        p["due"] = True
+                        continue
+                    if hit:
+                        g = rec(p, p["epx"] * (1 + p["d"] * tp), t.iloc[j], "TARGET")
+                    else:                            # postponed TP: exit at market once allowed
+                        g = rec(p, close[j], t.iloc[j], "DEFERRED EXIT (min_open)")
                     cash += g - fee_side
                     opn.remove(p)
         if j in sig:
             d, px = sig[j]
             if side and d != side:
+                continue
+            if max_open and len(opn) >= max_open:    # simultaneous-trade cap reached
+                skipped_cap += 1
                 continue
             unreal = sum(notional * p["d"] * (close[j] / p["epx"] - 1) for p in opn)
             if cash + unreal - len(opn) * MARGIN < MARGIN + fee_side:   # no free margin left
@@ -241,12 +263,14 @@ def hold_backtest(df, length, days, tf, side, balance):
                 continue
             cash -= fee_side
             opn.append(dict(d=d, epx=px, et=t.iloc[j], mae=0.0, mfe=0.0, fav=0.0))
+            peak = max(peak, len(opn))
     unreal = 0.0
     for p in opn:
         rec(p, close[-1], t.iloc[-1], "open (MTM)")
         unreal += notional * p["d"] * (close[-1] / p["epx"] - 1)
     extra = dict(account_liq=dead, min_equity=round(min_eq if not dead else 0.0, 2),
-                 final_equity=round(cash + unreal, 2), skipped=skipped)
+                 final_equity=round(cash + unreal, 2), skipped=skipped, skipped_cap=skipped_cap,
+                 peak_open=peak)
     return pd.DataFrame(trades), len(sig), extra
 
 
@@ -254,7 +278,7 @@ def summarize(tf, tr, npv, extra=None, err=""):
     s = dict(tf=tf, pivots=npv, trades=0, long=0, short=0, wins=0, win_pct=0.0, net_pnl=0.0,
              realised=0.0, open_mtm=0.0, tp_hits=0, open_n=0, liq=0, sl_hits=0, worst_mae=0.0,
              fees=0.0, profit_factor=0.0, max_dd=0.0, account_liq="", min_equity="",
-             final_equity="", skipped="", note=err)
+             final_equity="", skipped="", skipped_cap="", peak_open="", note=err)
     s.update(extra or {})
     if tr.empty:
         return s
@@ -275,7 +299,7 @@ def summarize(tf, tr, npv, extra=None, err=""):
     return s
 
 
-def plot_all(all_tr, path):
+def plot_all(all_tr, path, title):
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -287,93 +311,70 @@ def plot_all(all_tr, path):
         g = g.sort_values("exit_time")
         ax.step(g.exit_time, g.net_pnl.cumsum(), where="post", marker="o", label=tf)
     ax.axhline(0, color="gray", lw=0.8)
-    ax.set_title("Equity curves - all timeframes (Rs, net of fees)")
+    ax.set_title(title + "\nEquity curves (Rs, net of fees)", fontsize=10)
     ax.legend(); fig.autofmt_xdate(); fig.tight_layout(); fig.savefig(path, dpi=120)
 
 
-def gh_summary(sm, args, pair):
+LEGEND = [
+    ("run_id", "Unique name of this run: coin-mode-days-leverage-(tp/sl/limits)-UTC time"),
+    ("coin / pair / exchange", "Coin, trading pair, and the exchange the candles came from"),
+    ("mode", "reverse | reverse_pivot_price (hindsight, NOT tradable) | hold_long | hold_short | hold_both"),
+    ("tf", "Candle timeframe of that row"),
+    ("pivots / trades / long / short", "Confirmed pivots in window; trades taken; split by side"),
+    ("net_pnl", "Rs profit/loss after fees. Includes open trades marked at the last price"),
+    ("realised / open_mtm", "Closed-trade P&L / unrealised P&L of trades still open at the end"),
+    ("tp_hits / open_n", "Trades that hit take-profit / trades still open at the end"),
+    ("liq / sl_hits", "Liquidations (trade or whole account) / stop-loss exits"),
+    ("worst_mae", "Worst move AGAINST a trade, in % of price (10x: 10% = 100% of margin)"),
+    ("max_dd", "Worst fall of cumulative closed P&L from its peak, Rs"),
+    ("account_liq / min_equity / final_equity", "Hold modes: whole account liquidated? lowest and final equity, Rs"),
+    ("peak_open", "Hold modes: highest number of trades open at the same time"),
+    ("skipped / skipped_cap", "Hold modes: signals skipped for no free margin / for max_open limit"),
+    ("status (trades)", "TARGET, closed (opposite pivot), STOP LOSS, LIQUIDATED, ACCOUNT LIQUIDATED, "
+                        "DEFERRED EXIT (min_open), open (MTM)"),
+    ("mfe_pct / mae_pct / hold_h", "Best move for / worst move against the trade (% of price); hours held"),
+    ("min_open / max_open", "Hold modes: minimum trades kept running / maximum trades at the same time (0 = off)"),
+]
+
+
+def write_excel(path, summary, trades, pivots, settings):
+    try:
+        import openpyxl
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        print("openpyxl not installed -> Excel file skipped (CSV files are still saved)")
+        return
+    with pd.ExcelWriter(path, engine="openpyxl") as xw:
+        summary.to_excel(xw, sheet_name="Summary", index=False)
+        (trades if trades is not None and len(trades) else pd.DataFrame({"info": ["no trades"]})) \
+            .to_excel(xw, sheet_name="Trades", index=False)
+        (pivots if pivots is not None and len(pivots) else pd.DataFrame({"info": ["no pivots"]})) \
+            .to_excel(xw, sheet_name="Pivots", index=False)
+        pd.DataFrame(list(settings.items()), columns=["setting", "value"]) \
+            .to_excel(xw, sheet_name="Settings", index=False)
+        pd.DataFrame(LEGEND, columns=["column", "meaning"]).to_excel(xw, sheet_name="Legend", index=False)
+        for ws in xw.book.worksheets:
+            ws.freeze_panes = "A2"
+            ws.auto_filter.ref = ws.dimensions
+            for i, col in enumerate(ws.columns, 1):
+                width = max(len(str(c.value)) if c.value is not None else 0 for c in list(col)[:300])
+                ws.column_dimensions[get_column_letter(i)].width = min(max(width + 2, 8), 45)
+
+
+def gh_summary(sm, args, pair, run_id):
     path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not path:
         return
     hold = args.mode.startswith("hold")
     with open(path, "a") as f:
-        f.write(f"## Pivot Backtest | {pair} | {args.price} | {args.days}d | {args.mode} | "
-                f"{LEV:g}x | SL {SL:g}% | TP {TP:g}% | pivot length {args.length}\n\n")
+        f.write(f"## {pair} | {args.mode} | {args.days}d | {LEV:g}x | SL {SL:g}% | TP {TP:g}%"
+                f"{f' | open {args.min_open}-{args.max_open}' if hold else ''} | pivot length {args.length}\n\n")
+        f.write(f"`run_id: {run_id}`\n\n")
         if args.mode == "reverse_pivot_price":
             f.write("> NOT TRADABLE: entry at the real pivot price needs future data. Comparison only.\n\n")
-        f.write("| TF | Trades | TP hits | Still open | Win% | Net P&L | Realised | Open (MTM) | "
+        f.write("| TF | Exchange | Trades | TP hits | Still open | Win% | Net P&L | Realised | Open (MTM) | "
                 "Liquidated | SL hits | Worst adverse % | Fees | PF | Max DD |\n")
-        f.write("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n")
+        f.write("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n")
         for r in sm.itertuples():
-            f.write(f"| {r.tf} | {r.trades} | {r.tp_hits} | {r.open_n} | {r.win_pct}% | {r.net_pnl} | "
-                    f"{r.realised} | {r.open_mtm} | {r.liq} | {r.sl_hits} | {r.worst_mae} | {r.fees} | "
-                    f"{r.profit_factor} | {r.max_dd} |{' ' + r.note if r.note else ''}\n")
-        if hold:
-            f.write(f"\n**Cross-margin account (start Rs {args.balance:g})**\n\n")
-            f.write("| TF | Account liquidated? | Lowest equity | Final equity | Signals skipped (no free margin) |\n")
-            f.write("|---|---|---|---|---|\n")
-            for r in sm.itertuples():
-                f.write(f"| {r.tf} | {r.account_liq} | {r.min_equity} | {r.final_equity} | {r.skipped} |\n")
-        f.write(f"\nMargin Rs {MARGIN:.0f} x {LEV:g}x = Rs {MARGIN*LEV:.0f} position, fee {FEE_PCT}%/side "
-                "on position. Funding & slippage ignored. Few trades = low statistical value.\n")
-
-
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--pair", default="BTCUSDT")
-    ap.add_argument("--days", type=int, default=30)
-    ap.add_argument("--price", default="LAST_PRICE", choices=list(EXCHANGES))
-    ap.add_argument("--length", type=int, default=50)
-    ap.add_argument("--tfs", default=",".join(TFS))
-    ap.add_argument("--first", default="", help="preferred exchange tried first (ccxt id)")
-    ap.add_argument("--lev", type=float, default=10)
-    ap.add_argument("--margin", type=float, default=1000)
-    ap.add_argument("--sl", type=float, default=0, help="stop-loss %% of price, 0 = off")
-    ap.add_argument("--tp", type=float, default=0, help="take-profit %% of price, 0 = off")
-    ap.add_argument("--mode", default="reverse", choices=MODES)
-    ap.add_argument("--balance", type=float, default=10000, help="cross-margin account balance (hold modes)")
-    a = ap.parse_args()
-    LEV, MARGIN, SL, TP = a.lev, a.margin, a.sl, a.tp
-    hold = a.mode.startswith("hold")
-    if hold and TP <= 0:
-        TP = 5.0
-        print("hold mode needs a target -> using TP = 5% of price")
-    pair = norm_pair(a.pair)
-
-    all_tr, rows, pivs = [], [], []
-    for tf in a.tfs.split(","):
-        try:
-            df = fetch(pair, tf, a.days, 2 * a.length + 5, a.price, a.first.strip().lower())
-            pivs.append(list_pivots(df, a.length, a.days, tf))
-            if hold:
-                side = {"hold_long": 1, "hold_short": -1, "hold_both": 0}[a.mode]
-                tr, npv, extra = hold_backtest(df, a.length, a.days, tf, side, a.balance)
-            else:
-                tr, npv, extra = reverse_backtest(df, a.length, a.days, tf, a.mode == "reverse_pivot_price")
-            rows.append(summarize(tf, tr, npv, extra))
-            if not tr.empty:
-                all_tr.append(tr)
-        except Exception as e:
-            print(f"[{tf}] ERROR: {e}")
-            rows.append(summarize(tf, pd.DataFrame(), 0, None, "ERROR: " + str(e)[:300]))
-
-    sm = pd.DataFrame(rows)
-    smd = sm if hold else sm.drop(columns=["account_liq", "min_equity", "final_equity", "skipped"])
-    print("\n" + "=" * 78)
-    print(f"{pair} | {a.price} | {a.days}d | mode {a.mode} | length {a.length} | margin Rs {MARGIN:.0f} x {LEV:g}x"
-          f" | SL {SL:g}% | TP {TP:g}% | fee {FEE_PCT}%/side" + (f" | balance Rs {a.balance:g}" if hold else ""))
-    if a.mode == "reverse_pivot_price":
-        print("NOTE: entry at real pivot price is NOT tradable (look-ahead) - comparison only.")
-    print("=" * 78)
-    print(smd.drop(columns="note").to_string(index=False))
-    smd.to_csv("backtest_summary.csv", index=False)
-    if pivs:
-        pv = pd.concat(pivs, ignore_index=True)
-        pv.to_csv("backtest_pivots.csv", index=False)
-        print("\nPIVOTS - last 150 (pivot_time = real pivot, confirmed_time = when strategy can enter; full list in CSV)\n" + pv.tail(150).to_string(index=False))
-    if all_tr:
-        at = pd.concat(all_tr, ignore_index=True)
-        at.to_csv("backtest_all_trades.csv", index=False)
-        print("\nALL TRADES - last 150 (full list in CSV)\n" + at.tail(150).to_string(index=False))
-        plot_all(at, "equity_all.png")
-    gh_summary(sm, a, pair)
+            f.write(f"| {r.tf} | {r.exchange} | {r.trades} | {r.tp_hits} | {r.open_n} | {r.win_pct}% | "
+                    f"{r.net_p
