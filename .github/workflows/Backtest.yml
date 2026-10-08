@@ -84,11 +84,20 @@ jobs:
       - name: Run backtest (all 5 timeframes)
         shell: bash
         run: |
-          FILE=$(find . -maxdepth 1 -type f -iname 'pivot*backtest*' | head -n 1)
+          if [ -f pivot_backtest.py ]; then
+            FILE=pivot_backtest.py
+          else
+            FILE=$(find . -maxdepth 1 -type f -iname 'pivot*backtest*' | head -n 1)
+          fi
           if [ -z "$FILE" ]; then
             echo "Script file nahi mili:"; ls -la; exit 1
           fi
           echo "Using script: $FILE"
+          if ! grep -q "END_OF_SCRIPT" "$FILE"; then
+            echo "ERROR: script file adhoori hai (copy-paste beech me kat gaya). Poori file dobara upload karo."
+            exit 1
+          fi
+          python -m py_compile "$FILE" || { echo "ERROR: script me syntax error"; exit 1; }
           RANGE="${{ github.event.inputs.open_range || '0-0' }}"
           case "$RANGE" in *-*) ;; *) RANGE="0-$RANGE" ;; esac
           MIN_OPEN="${RANGE%-*}"
