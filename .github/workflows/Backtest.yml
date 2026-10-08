@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       pair:
-        description: "USDT Pair (e.g. BTCUSDT). Optional exchange: BRUSDT@mexc"
+        description: "USDT Pair (e.g. BTCUSDT or BRUSDT@mexc). With scan on: ALL = whole exchange, or A,B,C"
         required: true
         default: "BTCUSDT"
       days:
@@ -62,15 +62,15 @@ on:
         description: "Simultaneous trades min-max, hold modes only (e.g. 1-3, 0-0 = no limit)"
         required: false
         default: "0-0"
-      length:
-        description: "Pivot length (optional)"
+      scan:
+        description: "Pump-dump scan: 0 = off. 40 = coins with >=40% pump AND >=40% dump. Full format: 40,gateio,300,15 (pct,exchange,max scan,max test)"
         required: false
-        default: "50"
+        default: "0"
 
 jobs:
   backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
 
@@ -113,7 +113,7 @@ jobs:
             --balance "${{ github.event.inputs.balance || '10000' }}" \
             --min_open "$MIN_OPEN" \
             --max_open "$MAX_OPEN" \
-            --length "${{ github.event.inputs.length || '50' }}" \
+            --scan "${{ github.event.inputs.scan || '0' }}" \
             --out results
 
       - name: Upload results
