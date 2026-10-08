@@ -1,90 +1,114 @@
-name: Crypto Pivot Backtest (INR & Leverage)
+name: Pivot Backtest
 
 on:
-  push:
-    branches: [ "main", "master" ]
   workflow_dispatch:
     inputs:
-      coin:
-        description: 'Select Coin'
+      pair:
+        description: "USDT Pair (e.g. BTCUSDT)"
         required: true
-        default: 'ETH'
+        default: "BTCUSDT"
+      days:
+        description: "Timeline - last N days"
+        required: true
         type: choice
+        default: "30"
         options:
-          - ETH
-          - SOL
-          - BTC
-          - DOGE
-      period:
-        description: 'Lookback Period'
+          - "7"
+          - "15"
+          - "30"
+          - "45"
+          - "60"
+          - "90"
+          - "180"
+          - "270"
+          - "365"
+      price_type:
+        description: "Candle price type"
         required: true
-        default: '30d'
         type: choice
+        default: "LAST_PRICE"
         options:
-          - '30d'
-          - '60d'
-          - '180d'
-      timeframe:
-        description: 'Timeframe (1h recommended)'
+          - LAST_PRICE
+          - MARK_PRICE
+          - INDEX_PRICE
+      mode:
+        description: "Mode (reverse / reverse_pivot_price / hold_long / hold_short / hold_both)"
         required: true
-        default: '1h'
         type: choice
+        default: "reverse"
         options:
-          - '1h'
-          - '15m'
-          - '4h'
-      trade_amount:
-        description: 'Margin Per Trade (₹ INR)'
-        required: true
-        default: '1000'
+          - reverse
+          - reverse_pivot_price
+          - hold_long
+          - hold_short
+          - hold_both
       leverage:
-        description: 'Leverage Multiplier'
-        required: true
-        default: '5'
-        type: choice
-        options:
-          - '5'
-          - '7'
-          - '10'
-          - '3'
-      pivot_length:
-        description: 'Pivot Length'
-        required: true
-        default: '3'
+        description: "Leverage (x)"
+        required: false
+        default: "10"
+      stop_loss:
+        description: "Stop-loss % of price (0 = off, ignored in hold modes)"
+        required: false
+        default: "0"
+      take_profit:
+        description: "Take-profit % of price (0 = off; hold modes need it, 5 = +50% on 10x)"
+        required: false
+        default: "0"
+      balance:
+        description: "Cross-margin account balance Rs (hold modes only)"
+        required: false
+        default: "10000"
+      first_exchange:
+        description: "Preferred exchange, tried first (optional, e.g. gateio)"
+        required: false
+        default: ""
+      length:
+        description: "Pivot length (optional)"
+        required: false
+        default: "50"
 
 jobs:
   backtest:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 120
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
-      - name: Install Libraries
+      - name: Install dependencies
+        run: pip install pandas numpy ccxt matplotlib
+
+      - name: Run backtest (all 5 timeframes)
+        shell: bash
         run: |
-          pip install numpy pandas yfinance
+          FILE=$(find . -maxdepth 1 -type f -iname 'pivot*backtest*' | head -n 1)
+          if [ -z "$FILE" ]; then
+            echo "Script file nahi mili:"; ls -la; exit 1
+          fi
+          echo "Using script: $FILE"
+          python "$FILE" \
+            --pair "${{ github.event.inputs.pair }}" \
+            --days "${{ github.event.inputs.days }}" \
+            --price "${{ github.event.inputs.price_type }}" \
+            --mode "${{ github.event.inputs.mode }}" \
+            --lev "${{ github.event.inputs.leverage || '10' }}" \
+            --sl "${{ github.event.inputs.stop_loss || '0' }}" \
+            --tp "${{ github.event.inputs.take_profit || '0' }}" \
+            --balance "${{ github.event.inputs.balance || '10000' }}" \
+            --first "${{ github.event.inputs.first_exchange }}" \
+            --length "${{ github.event.inputs.length || '50' }}"
 
-      - name: Run Backtester
-        run: |
-          export COIN="${{ github.event.inputs.coin || 'ETH' }}"
-          export PERIOD="${{ github.event.inputs.period || '30d' }}"
-          export TIMEFRAME="${{ github.event.inputs.timeframe || '1h' }}"
-          export TRADE_AMOUNT="${{ github.event.inputs.trade_amount || '1000' }}"
-          export LEVERAGE="${{ github.event.inputs.leverage || '5' }}"
-          export PIVOT_LENGTH="${{ github.event.inputs.pivot_length || '3' }}"
-
-          python backtest_pivots.py | tee output.log
-
-      - name: Show Results in GitHub Summary
+      - name: Upload results
+        uses: actions/upload-artifact@v4
         if: always()
-        run: |
-          echo "## 🎯 Pivot Partial Booking Summary (₹ INR)" >> $GITHUB_STEP_SUMMARY
-          echo '```text' >> $GITHUB_STEP_SUMMARY
-          cat output.log >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+        with:
+          name: backtest-results
+          path: |
+            backtest_summary.csv
+            backtest_all_trades.csv
+            backtest_pivots.csv
+            equity_all.png
+          if-no-files-found: warn
