@@ -24,12 +24,13 @@ PUMP & DUMP SCAN (--scan "40,gateio,300,15")
   Scans the exchange's USDT coins for the same timeline (--days). A coin qualifies if it PUMPED at least
   X% (low -> later high) AND then DUMPED at least X% from that peak. Only the qualifying coins are then
   backtested (all timeframes, same settings). Format: pct[,exchange[,max_coins_to_scan[,max_coins_to_test]]]
+  Exchange priority: COIN@exchange in --pair  >  exchange in the scan string  >  default gate (Gate.io).
   --pair ALL = whole exchange, --pair A,B,C = only scan these, one pair = just check that coin.
 
 Every output file name + every row carries run_id / coin / pair / exchange so uploads are self-explaining.
 Outputs (folder results/): <run_id>_summary.csv, _trades.csv, _pivots.csv, _scan.csv, _equity.png, <run_id>.xlsx
 Run: python pivot_backtest.py --pair BTCUSDT --days 30 --mode hold_long --tp 5 --balance 10000 --max_open 3
-Pair can carry a preferred exchange:  --pair BRUSDT@mexc
+Pair can carry the exchange:  --pair BRUSDT@mexc  (ONLY that exchange is used; "gateio" = "gate")
 """
 import argparse, os, re, time
 from datetime import datetime, timezone
@@ -47,10 +48,27 @@ MODES = ["reverse", "reverse_pivot_price", "hold_long", "hold_short", "hold_both
 # Tried in order until one has the pair. (bybit/binance.com block GitHub's US servers,
 # so they are kept last; gateio/mexc/kucoin/bitget list far more altcoins.)
 EXCHANGES = {
-    "LAST_PRICE": ["binanceus", "gateio", "mexc", "kucoin", "bitget", "okx", "bybit"],
-    "MARK_PRICE": ["gateio", "bitget", "okx", "bybit", "binanceusdm", "kucoinfutures"],
-    "INDEX_PRICE": ["gateio", "bitget", "okx", "bybit", "binanceusdm"],
+    "LAST_PRICE": ["binanceus", "gate", "mexc", "kucoin", "bitget", "okx", "bybit"],
+    "MARK_PRICE": ["gate", "bitget", "okx", "bybit", "binanceusdm", "kucoinfutures"],
+    "INDEX_PRICE": ["gate", "bitget", "okx", "bybit", "binanceusdm"],
 }
+# Friendly / old names -> current ccxt id (ccxt renamed gateio -> gate)
+ALIASES = {"gateio": "gate", "gate.io": "gate", "gate_io": "gate", "okex": "okx", "huobi": "htx",
+           "kucoinfut": "kucoinfutures", "binanceusa": "binanceus"}
+
+
+def canon(name):
+    n = str(name).strip().lower()
+    return ALIASES.get(n, n)
+
+
+def get_exchange(name):
+    """name (any alias) -> (ccxt exchange object, ccxt id)."""
+    import ccxt
+    n = canon(name)
+    if not hasattr(ccxt, n):
+        raise ValueError(f"exchange '{name}' ccxt me nahi hai")
+    return getattr(ccxt, n)({"enableRateLimit": True}), n
 HOLD_ONLY_COLS = ["account_liq", "min_equity", "final_equity", "skipped", "skipped_cap", "peak_open"]
 
 
@@ -63,15 +81,17 @@ def norm_pair(p):
     return p
 
 
-def fetch(pair, tf, days, warmup, price, first=""):
+def fetch(pair, tf, days, warmup, price, first="", strict=False):
     """Returns (df, info). Tries exchanges in order. Prefers one with the FULL requested history;
-    if none has it, uses the one with the most history and prints a warning."""
-    import ccxt
+    if none has it, uses the one with the most history and prints a warning.
+    strict=True (pair written as COIN@exchange): ONLY that exchange is used, no fallback."""
     errs, best = [], None
-    order = ([first] if first else []) + [e for e in EXCHANGES[price] if e != first]
+    first = canon(first) if first else ""
+    order = [first] if (strict and first) else \
+        ([first] if first else []) + [e for e in EXCHANGES[price] if e != first]
     for name in order:
         try:
-            ex = getattr(ccxt, name)({"enableRateLimit": True})
+            ex, name = get_exchange(name)
             ex.load_markets()
             sym = pair if price == "LAST_PRICE" else pair + ":" + pair.split("/")[1]
             if sym not in ex.markets:
@@ -129,7 +149,7 @@ def parse_scan(s):
     pct = float(parts[0])
     if pct <= 0:
         return None
-    ex = parts[1].lower() if len(parts) > 1 and parts[1] else "gateio"
+    ex = canon(parts[1]) if len(parts) > 1 and parts[1] else "gate"
     mx_scan = int(parts[2]) if len(parts) > 2 and parts[2] else 300
     mx_test = int(parts[3]) if len(parts) > 3 and parts[3] else 15
     return dict(pct=pct, exchange=ex, max_scan=mx_scan, max_test=mx_test)
@@ -179,8 +199,7 @@ def detect_pump_dump(df, pct):
 
 def scan_pump_dump(pairs, scan, days):
     """Returns (found_df, n_scanned). pairs=None -> every active USDT spot coin on the exchange."""
-    import ccxt
-    ex = getattr(ccxt, scan["exchange"])({"enableRateLimit": True})
+    ex, scan["exchange"] = get_exchange(scan["exchange"])
     ex.load_markets()
     tf = "1h" if days <= 60 else "4h"
     if pairs:
@@ -516,14 +535,14 @@ def gh_summary(sm, args, label, run_id, scan, scan_df, n_scanned):
                 "on position. Funding & slippage ignored. Few trades = low statistical value.\n")
 
 
-def run_coin(pair, a, first, run_id, ts, hold):
+def run_coin(pair, a, first, run_id, ts, hold, strict=False):
     """Backtest ONE coin on all timeframes -> (summary rows, trades df|None, pivots df|None)."""
     coin = pair.split("/")[0]
     rows, trs, pvs, ex_by_tf = [], [], [], {}
     for tf in a.tfs.split(","):
         info = {}
         try:
-            df, info = fetch(pair, tf, a.days, 2 * a.length + 5, a.price, first)
+            df, info = fetch(pair, tf, a.days, 2 * a.length + 5, a.price, first, strict)
             ex_by_tf[tf] = info["exchange"]
             pvs.append(list_pivots(df, a.length, a.days, tf))
             if hold:
@@ -560,12 +579,12 @@ def run_coin(pair, a, first, run_id, ts, hold):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--pair", default="BTCUSDT",
-                    help="BTCUSDT | BRUSDT@mexc (preferred exchange) | with --scan: ALL or A,B,C")
+                    help="BTCUSDT | BRUSDT@mexc (only that exchange) | with --scan: ALL, ALL@mexc or A,B,C")
     ap.add_argument("--days", type=int, default=30)
     ap.add_argument("--price", default="LAST_PRICE", choices=list(EXCHANGES))
     ap.add_argument("--length", type=int, default=50)
     ap.add_argument("--tfs", default=",".join(TFS))
-    ap.add_argument("--first", default="", help="preferred exchange tried first (ccxt id)")
+    ap.add_argument("--first", default="", help="preferred exchange tried first, others as fallback")
     ap.add_argument("--lev", type=float, default=10)
     ap.add_argument("--margin", type=float, default=1000)
     ap.add_argument("--sl", type=float, default=0, help="stop-loss %% of price, 0 = off")
@@ -593,15 +612,23 @@ if __name__ == "__main__":
         print("hold mode needs a target -> using TP = 5% of price")
     if not hold and (a.min_open or a.max_open):
         print("note: min_open / max_open apply to hold modes only (reverse modes hold 1 trade at a time)")
-    raw_pair, first = a.pair.strip(), a.first.strip().lower()
-    if "@" in raw_pair:
-        raw_pair, ex_pref = raw_pair.split("@", 1)
-        first = ex_pref.strip().lower() or first
+    ex_pref, items = "", []
+    for item in a.pair.strip().split(","):          # BTCUSDT@mexc  or  A@mexc,B,C
+        if "@" in item:
+            item, e = item.split("@", 1)
+            ex_pref = ex_pref or canon(e)
+        items.append(item.strip())
+    raw_pair = ",".join(i for i in items if i)
+    first = ex_pref or canon(a.first)                # exchange written next to the coin wins
+    strict = bool(ex_pref)                           # COIN@exchange = use ONLY that exchange
     ts = datetime.now(timezone.utc)
 
     scan_df, n_scanned = None, 0
     if scan:
-        first = scan["exchange"]                       # test the coins on the exchange they were found on
+        if ex_pref:
+            scan["exchange"] = ex_pref                 # pair@exchange beats the scan string / default
+        scan["exchange"] = canon(scan["exchange"])
+        first, strict = scan["exchange"], True         # test the coins on the exchange they were found on
         pairs = None if raw_pair.upper() in ("", "ALL", "*") else \
             [norm_pair(p.strip()) for p in raw_pair.split(",") if p.strip()]
         scan_df, n_scanned = scan_pump_dump(pairs, scan, a.days)
@@ -630,7 +657,7 @@ if __name__ == "__main__":
         if scan:
             r0 = scan_df.iloc[n - 1]
             print(f"\n===== coin {n}/{len(coins)}: {pr}  (pump {r0.pump_pct}% / dump {r0.dump_pct}%) =====")
-        rows, trades, pivots = run_coin(pr, a, first, run_id, ts, hold)
+        rows, trades, pivots = run_coin(pr, a, first, run_id, ts, hold, strict)
         all_rows += rows
         if trades is not None:
             all_tr.append(trades)
