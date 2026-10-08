@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       pair:
-        description: "USDT Pair (e.g. BTCUSDT or BRUSDT@mexc). With scan on: ALL = whole exchange, or A,B,C"
+        description: "USDT Pair. BTCUSDT@mexc = use ONLY mexc. With scan on: ALL, ALL@mexc or A,B,C"
         required: true
         default: "BTCUSDT"
       days:
@@ -63,7 +63,7 @@ on:
         required: false
         default: "0-0"
       scan:
-        description: "Pump-dump scan: 0 = off. 40 = coins with >=40% pump AND >=40% dump. Full format: 40,gateio,300,15 (pct,exchange,max scan,max test)"
+        description: "Pump-dump scan: 0 = off. 40 = coins with >=40% pump AND >=40% dump. Full format: 40,gate,300,15 (pct,exchange,max scan,max test). Exchange in Pair box (@) wins"
         required: false
         default: "0"
 
