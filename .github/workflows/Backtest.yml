@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       pair:
-        description: "USDT Pair (e.g. BTCUSDT)"
+        description: "USDT Pair (e.g. BTCUSDT). Optional exchange: BRUSDT@mexc"
         required: true
         default: "BTCUSDT"
       days:
@@ -58,10 +58,10 @@ on:
         description: "Cross-margin account balance Rs (hold modes only)"
         required: false
         default: "10000"
-      first_exchange:
-        description: "Preferred exchange, tried first (optional, e.g. gateio)"
+      open_range:
+        description: "Simultaneous trades min-max, hold modes only (e.g. 1-3, 0-0 = no limit)"
         required: false
-        default: ""
+        default: "0-0"
       length:
         description: "Pivot length (optional)"
         required: false
@@ -79,7 +79,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install pandas numpy ccxt matplotlib
+        run: pip install pandas numpy ccxt matplotlib openpyxl
 
       - name: Run backtest (all 5 timeframes)
         shell: bash
@@ -89,6 +89,10 @@ jobs:
             echo "Script file nahi mili:"; ls -la; exit 1
           fi
           echo "Using script: $FILE"
+          RANGE="${{ github.event.inputs.open_range || '0-0' }}"
+          case "$RANGE" in *-*) ;; *) RANGE="0-$RANGE" ;; esac
+          MIN_OPEN="${RANGE%-*}"
+          MAX_OPEN="${RANGE#*-}"
           python "$FILE" \
             --pair "${{ github.event.inputs.pair }}" \
             --days "${{ github.event.inputs.days }}" \
@@ -98,17 +102,15 @@ jobs:
             --sl "${{ github.event.inputs.stop_loss || '0' }}" \
             --tp "${{ github.event.inputs.take_profit || '0' }}" \
             --balance "${{ github.event.inputs.balance || '10000' }}" \
-            --first "${{ github.event.inputs.first_exchange }}" \
-            --length "${{ github.event.inputs.length || '50' }}"
+            --min_open "$MIN_OPEN" \
+            --max_open "$MAX_OPEN" \
+            --length "${{ github.event.inputs.length || '50' }}" \
+            --out results
 
       - name: Upload results
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: backtest-results
-          path: |
-            backtest_summary.csv
-            backtest_all_trades.csv
-            backtest_pivots.csv
-            equity_all.png
+          name: backtest-run${{ github.run_number }}
+          path: results/
           if-no-files-found: warn
