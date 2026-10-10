@@ -1,28 +1,33 @@
 #!/usr/bin/env python3
 """
-(VWAP rule: default "reversal" = long only if price was ALREADY below VWAP before
-the signal candle, short only if ALREADY above. Use --vwap-mode trend for the opposite.)
-BRAHMASTRA STRATEGY - Backtest engine
-=====================================
-Rules (as described by the user):
+BRAHMASTRA STRATEGY - Backtest engine (futures style: fixed margin + leverage)
+==============================================================================
+Rules:
  1. Supertrend (ATR 20, mult 2) flips direction and the candle CLOSES beyond the
-    line -> this is the "signal/confirmation candle" (C). On a following candle,
-    the trade triggers when price breaks the HIGH of C (long) / LOW of C (short).
- 2. MACD (12,26,9) crossover in the trade direction. A cross within the last
-    `macd_lookback` candles before/at C, or after C (before entry), counts.
- 3. Long only if price (last closed candle) is ABOVE VWAP, short only if BELOW.
+    line -> this is the "signal candle" (C). On a following candle the trade
+    triggers when price breaks the HIGH of C (long) / LOW of C (short).
+ 2. MACD (12,26,9) crossover in the trade direction, within `macd_lookback`
+    candles before C, at C, or after C (before entry).
+ 3. VWAP (default "reversal"): long only if price was ALREADY BELOW VWAP before
+    the signal candle, short only if ALREADY ABOVE ("trend" mode = opposite).
  Exit:
     - SL  : low of the candle BEFORE the signal candle (long) / its high (short)
     - TP  : Supertrend flips against the trade OR opposite MACD crossover,
             confirmed on candle close (exit at that close).
+    - LIQUIDATION: if price reaches the liquidation price before the SL, the
+            whole margin is lost.
 
-No look-ahead: every condition is evaluated on candles closed before the entry
-candle; the entry itself is a stop-entry filled at max(open, trigger) (long).
-If SL and entry occur in the same candle, SL is assumed hit (conservative).
+Money model: every trade uses a fixed MARGIN (default Rs 1000, no compounding).
+Position size = margin x leverage. P&L(Rs) = margin x leverage x net price move,
+where net price move already includes fees + slippage on the full notional.
+Liquidation price = entry x (1 -/+ (1/leverage - maintenance_margin)).
+
+No look-ahead: conditions use candles closed before the entry candle; entry is a
+stop-entry filled at max(open, trigger) (long). If SL and entry occur in the same
+candle, SL is assumed hit (conservative).
 
 Data: CSV per symbol in a folder, columns: timestamp,open,high,low,close,volume
-(timestamp = unix seconds / ms, or ISO string, UTC). Any base timeframe that is
-<= the timeframes you test (e.g. 5m data gives 5m/15m/1h/4h/1d/1w/1M).
+(timestamp = unix seconds / ms, or ISO string, UTC).
 """
 import argparse
 import glob
@@ -58,12 +63,9 @@ def load_csv(path):
 
 
 def resample(df, tf):
-    rule = TF_RULES[tf]
-    kw = dict(label="left", closed="left")
-    out = df.resample(rule, **kw).agg(
+    return df.resample(TF_RULES[tf], label="left", closed="left").agg(
         {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
     ).dropna(subset=["open", "close"])
-    return out
 
 
 # ----------------------------------------------------------- indicators ----
@@ -86,17 +88,13 @@ def supertrend(df, period=20, mult=2.0):
             d[i] = -1
         else:
             d[i] = d[i - 1]
-    line = np.where(d == 1, flb, fub)
-    return d, line
+    return d, np.where(d == 1, flb, fub)
 
 
 def macd_cross(close, fast=12, slow=26, sig=9):
-    ema_f = close.ewm(span=fast, adjust=False).mean()
-    ema_s = close.ewm(span=slow, adjust=False).mean()
-    macd = ema_f - ema_s
+    macd = close.ewm(span=fast, adjust=False).mean() - close.ewm(span=slow, adjust=False).mean()
     signal = macd.ewm(span=sig, adjust=False).mean()
-    # "fast line crosses slow line" = MACD line crossing the signal line
-    diff = (macd - signal).values
+    diff = (macd - signal).values  # "fast line crosses slow line" = MACD line vs signal line
     cross = np.zeros(len(diff), dtype=np.int8)
     cross[1:] = np.where((diff[1:] > 0) & (diff[:-1] <= 0), 1,
                          np.where((diff[1:] < 0) & (diff[:-1] >= 0), -1, 0))
@@ -105,7 +103,7 @@ def macd_cross(close, fast=12, slow=26, sig=9):
 
 def vwap(df, tf):
     """Anchored VWAP. Intraday TF -> resets each UTC day. 1d -> weekly anchor,
-    1w -> monthly anchor, 1M -> yearly anchor (daily anchor is meaningless there)."""
+    1w -> monthly anchor, 1M -> yearly anchor."""
     idx = df.index
     if tf in ("5m", "15m", "1h", "4h"):
         key = idx.normalize()
@@ -128,59 +126,56 @@ def backtest(df, tf, p):
         return []
     o, h, l, c = (df[k].values for k in ("open", "high", "low", "close"))
     ts = df.index
-    d, st_line = supertrend(df, p["st_period"], p["st_mult"])
+    d, _ = supertrend(df, p["st_period"], p["st_mult"])
     mc = macd_cross(df["close"])
     vw = vwap(df, tf)
-    slip, fee = p["slip"] / 100, p["fee"] / 100
+    slip, fee, tds = p["slip"] / 100, p["fee"] / 100, p["tds"] / 100
+    margin, mmr = p["margin"], p["mmr"] / 100
     lb, wait = p["macd_lookback"], p["wait_bars"]
 
     trades, pos = [], None
     setups = {1: None, -1: None}
     start = max(p["st_period"], 30) + 2
 
-    def close_trade(i, px, why):
+    def close_trade(i, px, why, liq=False):
         nonlocal pos
-        s = pos["side"]
-        xpx = px * (1 - slip * s)
-        gross = s * (xpx / pos["entry"] - 1)
-        cost = 2 * fee + (p["tds"] / 100 if True else 0)  # TDS on sell leg (set 0 if n/a)
-        net = gross - cost
+        s, lev = pos["side"], pos["lev"]
+        if liq:
+            xpx, net, pnl = px, -1.0 / lev, -margin
+        else:
+            xpx = px * (1 - slip * s)
+            net = s * (xpx / pos["entry"] - 1) - 2 * fee - tds   # costs on full notional
+            pnl = max(margin * lev * net, -margin)               # can never lose more than margin
         risk = abs(pos["entry"] - pos["sl"]) / pos["entry"]
         trades.append(dict(
-            side="LONG" if s == 1 else "SHORT", entry_time=ts[pos["i"]], exit_time=ts[i],
-            entry=pos["entry"], exit=xpx, sl=pos["sl"], exit_reason=why,
-            bars=i - pos["i"], gross_pct=gross * 100, net_pct=net * 100,
-            R=(net / risk) if risk > 0 else np.nan))
+            side="LONG" if s == 1 else "SHORT", lev=lev,
+            entry_time=ts[pos["i"]], exit_time=ts[i], entry=pos["entry"], exit=xpx,
+            sl=pos["sl"], liq=pos["liq"], exit_reason=why, bars=i - pos["i"],
+            sl_pct=risk * 100, price_net_pct=net * 100, pnl_inr=pnl,
+            roi_margin_pct=pnl / margin * 100, R=(net / risk) if risk > 0 else np.nan))
         pos = None
 
     for i in range(start, n):
-        # ---- invalidate / expire setups using info up to bar i-1
-        for s in (1, -1):
+        for s in (1, -1):                       # expire/invalidate setups (info up to bar i-1)
             st = setups[s]
             if st and (d[i - 1] != s or i > st["C"] + wait):
                 setups[s] = None
 
-        # ---- try entry (stop-entry on bar i), only one position at a time
-        if pos is None:
+        if pos is None:                         # ---- try stop-entry on bar i
             for s in (1, -1):
                 st = setups[s]
                 if not st or i <= st["C"]:
                     continue
-                if s == 1 and not p["allow_long"] or s == -1 and not p["allow_short"]:
+                if (s == 1 and not p["allow_long"]) or (s == -1 and not p["allow_short"]):
                     continue
                 if not (st["trigger"] < h[i] if s == 1 else st["trigger"] > l[i]):
                     continue
-                # condition 2: MACD cross in direction within window [C-lb, i-1]
-                if not (mc[max(0, st["C"] - lb): i] == s).any():
+                if not (mc[max(0, st["C"] - lb): i] == s).any():      # MACD cross window
                     continue
-                # condition 3: VWAP side. "already" mode: price must ALREADY be on the
-                # right side of VWAP before the signal candle (candle C-1) and still
-                # be there on the last closed candle before entry.
-                if p["vwap_mode"] == "reversal":
-                    # price was ALREADY below VWAP (long) / above VWAP (short) before the signal candle
+                if p["vwap_mode"] == "reversal":                      # VWAP side
                     k = st["C"] - 1
                     ok = c[k] < vw[k] if s == 1 else c[k] > vw[k]
-                else:  # "trend": long above VWAP / short below VWAP, checked before entry
+                else:
                     ok = c[i - 1] > vw[i - 1] if s == 1 else c[i - 1] < vw[i - 1]
                 if not ok:
                     continue
@@ -191,60 +186,64 @@ def backtest(df, tf, p):
                     sl = st["sl_alt"]
                 if (sl >= entry if s == 1 else sl <= entry):
                     continue
-                pos = dict(side=s, i=i, entry=entry, sl=sl)
+                lev = p["lev_long"] if s == 1 else p["lev_short"]
+                liq = entry * (1 - s * max(1.0 / lev - mmr, 1e-9))
+                pos = dict(side=s, i=i, entry=entry, sl=sl, lev=lev, liq=liq)
                 setups[s] = None
                 break
 
-        # ---- manage open position on bar i
-        if pos is not None:
+        if pos is not None:                     # ---- manage open position on bar i
             s = pos["side"]
-            hit = l[i] <= pos["sl"] if s == 1 else h[i] >= pos["sl"]
+            if s == 1:
+                stop = max(pos["sl"], pos["liq"])
+                hit, is_liq = l[i] <= stop, pos["liq"] >= pos["sl"]
+            else:
+                stop = min(pos["sl"], pos["liq"])
+                hit, is_liq = h[i] >= stop, pos["liq"] <= pos["sl"]
             if hit:
-                fill = min(o[i], pos["sl"]) if s == 1 and i > pos["i"] else \
-                       max(o[i], pos["sl"]) if s == -1 and i > pos["i"] else pos["sl"]
-                close_trade(i, fill, "SL")
+                if is_liq:
+                    close_trade(i, stop, "LIQUIDATION", liq=True)
+                else:
+                    gap = i > pos["i"]
+                    fill = (min(o[i], stop) if s == 1 else max(o[i], stop)) if gap else stop
+                    close_trade(i, fill, "SL")
             elif d[i] == -s and d[i - 1] == s:
                 close_trade(i, c[i], "TP_SUPERTREND")
             elif mc[i] == -s:
                 close_trade(i, c[i], "TP_MACD")
 
-        # ---- arm new setup at close of bar i (supertrend flip + close beyond line)
-        if d[i] != d[i - 1]:
+        if d[i] != d[i - 1]:                    # ---- arm new setup at close of bar i
             s = int(d[i])
-            if i >= 1:
-                setups[s] = dict(
-                    C=i,
-                    trigger=h[i] if s == 1 else l[i],
-                    sl=l[i - 1] if s == 1 else h[i - 1],   # candle before signal candle
-                    sl_alt=l[i] if s == 1 else h[i])
-                setups[-s] = None
-    if pos is not None:                      # mark-to-market final bar
+            setups[s] = dict(C=i, trigger=h[i] if s == 1 else l[i],
+                             sl=l[i - 1] if s == 1 else h[i - 1],   # candle before signal candle
+                             sl_alt=l[i] if s == 1 else h[i])
+            setups[-s] = None
+    if pos is not None:
         close_trade(n - 1, c[-1], "END")
     return trades
 
 
-def stats(trades, df, alloc):
+def stats(trades, df):
     if not trades:
-        return dict(trades=0)
+        return dict(trades=0), None
     t = pd.DataFrame(trades)
-    r = t["net_pct"].values / 100 * alloc
-    eq = np.cumprod(1 + r)
-    peak = np.maximum.accumulate(np.r_[1.0, eq])[1:]
-    dd = (eq / peak - 1).min() * 100
-    years = max((df.index[-1] - df.index[0]).days / 365.25, 1e-9)
-    wins, losses = t.loc[t.net_pct > 0, "net_pct"], t.loc[t.net_pct <= 0, "net_pct"]
+    pnl = t["pnl_inr"].values
+    cum = np.cumsum(pnl)
+    peak = np.maximum.accumulate(np.r_[0.0, cum])[1:]
+    gains, losses = pnl[pnl > 0].sum(), -pnl[pnl <= 0].sum()
     return dict(
-        trades=len(t), win_rate=round((t.net_pct > 0).mean() * 100, 1),
-        total_return_pct=round((eq[-1] - 1) * 100, 2),
-        cagr_pct=round(((eq[-1]) ** (1 / years) - 1) * 100, 2) if eq[-1] > 0 else -100,
-        max_dd_pct=round(dd, 2),
-        profit_factor=round(wins.sum() / abs(losses.sum()), 2) if len(losses) and losses.sum() != 0 else np.inf,
-        avg_trade_pct=round(t.net_pct.mean(), 3), avg_R=round(t.R.mean(), 2),
+        trades=len(t), win_rate=round((pnl > 0).mean() * 100, 1),
+        total_pnl_inr=round(pnl.sum(), 1), avg_pnl_inr=round(pnl.mean(), 1),
+        max_dd_inr=round((cum - peak).min(), 1),
+        profit_factor=round(gains / losses, 2) if losses > 0 else np.inf,
+        avg_roi_margin_pct=round(t.roi_margin_pct.mean(), 2),
+        avg_sl_pct=round(t.sl_pct.mean(), 3), avg_R=round(t.R.mean(), 2),
+        liquidations=int((t.exit_reason == "LIQUIDATION").sum()),
         buy_hold_pct=round((df.close.iloc[-1] / df.close.iloc[0] - 1) * 100, 2),
-    ), eq
+    ), pd.Series(cum, index=t["exit_time"].values)
 
 
-def run(data_dir, tfs, p, outdir):
+def run(data_dir, tfs, p, scenarios, outdir):
     os.makedirs(outdir, exist_ok=True)
     files = sorted(glob.glob(os.path.join(data_dir, "*.csv")))
     if not files:
@@ -254,20 +253,22 @@ def run(data_dir, tfs, p, outdir):
         sym = os.path.splitext(os.path.basename(f))[0]
         base = load_csv(f)
         base_min = int(np.median(np.diff(base.index.values).astype("timedelta64[m]").astype(int)))
+        span = f"{base.index[0]:%Y-%m-%d} -> {base.index[-1]:%Y-%m-%d}"
+        print(f"[data] {sym}: {len(base)} candles ({base_min}m), {span}")
         for tf in tfs:
             if TF_MINUTES[tf] < base_min:
                 continue
             df = resample(base, tf)
-            tr = backtest(df, tf, p)
-            res = stats(tr, df, p["alloc"])
-            if isinstance(res, tuple):
-                s, eq = res
-                curves[(sym, tf)] = (pd.Series(eq, index=[t["exit_time"] for t in tr]))
-            else:
-                s = res
-            rows.append(dict(symbol=sym, tf=tf, bars=len(df), **s))
-            for t in tr:
-                all_tr.append(dict(symbol=sym, tf=tf, **t))
+            for ll, sl_ in scenarios:
+                q = dict(p, lev_long=ll, lev_short=sl_)
+                tr = backtest(df, tf, q)
+                s, cum = stats(tr, df)
+                lev_name = f"{ll}x" if ll == sl_ else f"L{ll}x/S{sl_}x"
+                rows.append(dict(symbol=sym, tf=tf, lev=lev_name, bars=len(df), **s))
+                if cum is not None:
+                    curves[(sym, tf, lev_name)] = cum
+                for t in tr:
+                    all_tr.append(dict(symbol=sym, tf=tf, **t))
     summ = pd.DataFrame(rows)
     summ.to_csv(os.path.join(outdir, "summary.csv"), index=False)
     pd.DataFrame(all_tr).to_csv(os.path.join(outdir, "trades.csv"), index=False)
@@ -275,48 +276,82 @@ def run(data_dir, tfs, p, outdir):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Brahmastra strategy backtest")
+    ap = argparse.ArgumentParser(description="Brahmastra strategy backtest (margin + leverage)")
+    ap.add_argument("--config", help="YAML settings file (see config.yml); CLI flags override it")
     ap.add_argument("--data", default="data", help="folder with SYMBOL.csv files")
     ap.add_argument("--out", default="results")
     ap.add_argument("--tfs", default="5m,15m,1h,4h,1d,1w,1M")
     ap.add_argument("--st-period", type=int, default=20)
     ap.add_argument("--st-mult", type=float, default=2.0)
-    ap.add_argument("--macd-lookback", type=int, default=2, help="candles before signal candle to accept a MACD cross")
-    ap.add_argument("--wait-bars", type=int, default=3, help="candles after signal candle in which breakout may trigger (1 = strictly next candle)")
-    ap.add_argument("--fee", type=float, default=0.1, help="%% per side")
-    ap.add_argument("--slip", type=float, default=0.05, help="%% per side")
-    ap.add_argument("--tds", type=float, default=0.0, help="%% India crypto TDS on sell (1.0 for real-world)")
-    ap.add_argument("--alloc", type=float, default=1.0, help="fraction of equity per trade (1.0 = all-in, no leverage)")
-    ap.add_argument("--vwap-mode", choices=["reversal", "trend"], default="reversal",
-                    help="reversal (default): long if price was already BELOW VWAP before the signal candle, short if already ABOVE; "
-                         "trend: long if price above VWAP, short if below")
+    ap.add_argument("--macd-lookback", type=int, default=2)
+    ap.add_argument("--wait-bars", type=int, default=3, help="candles after signal candle in which breakout may trigger")
+    ap.add_argument("--vwap-mode", choices=["reversal", "trend"], default="reversal")
+    ap.add_argument("--margin", type=float, default=1000.0, help="Rs margin per trade")
+    ap.add_argument("--leverages", default="5,10", help="comma list; each value is run as a separate scenario (both sides)")
+    ap.add_argument("--long-lev", type=float, help="optional: fixed long leverage (with --short-lev) instead of --leverages")
+    ap.add_argument("--short-lev", type=float, help="optional: fixed short leverage")
+    ap.add_argument("--mmr", type=float, default=0.5, help="%% maintenance margin used for liquidation price")
+    ap.add_argument("--fee", type=float, default=0.02, help="%% per side on notional (futures taker ~0.02-0.05; spot ~0.1)")
+    ap.add_argument("--slip", type=float, default=0.02, help="%% per side")
+    ap.add_argument("--tds", type=float, default=0.0, help="%% extra cost per trade on notional (0 for futures)")
     ap.add_argument("--no-short", action="store_true")
     ap.add_argument("--no-long", action="store_true")
+    pre, _ = ap.parse_known_args()
+    if pre.config:
+        import yaml
+        with open(pre.config) as fh:
+            cfg = yaml.safe_load(fh) or {}
+        g = lambda sec, key: (cfg.get(sec) or {}).get(key)
+        levs = g("leverage", "leverages")
+        mapping = {
+            "data": g("data", "folder"), "out": g("backtest", "output_folder"),
+            "tfs": ",".join(g("backtest", "timeframes") or []) or None,
+            "st_period": g("strategy", "supertrend_period"), "st_mult": g("strategy", "supertrend_multiplier"),
+            "macd_lookback": g("strategy", "macd_lookback"), "wait_bars": g("strategy", "wait_bars"),
+            "vwap_mode": g("strategy", "vwap_mode"),
+            "no_long": (g("strategy", "allow_long") is False) or None,
+            "no_short": (g("strategy", "allow_short") is False) or None,
+            "fee": g("costs", "fee_pct"), "slip": g("costs", "slippage_pct"), "tds": g("costs", "tds_pct"),
+            "margin": g("leverage", "margin_inr"), "mmr": g("leverage", "maintenance_margin_pct"),
+            "leverages": ",".join(str(x) for x in levs) if levs else None,
+        }
+        ap.set_defaults(**{k: v for k, v in mapping.items() if v is not None})
     a = ap.parse_args()
+
     p = dict(st_period=a.st_period, st_mult=a.st_mult, macd_lookback=a.macd_lookback,
-             wait_bars=a.wait_bars, vwap_mode=a.vwap_mode, fee=a.fee, slip=a.slip, tds=a.tds, alloc=a.alloc,
-             allow_long=not a.no_long, allow_short=not a.no_short)
-    summ, curves = run(a.data, [t.strip() for t in a.tfs.split(",")], p, a.out)
-    with pd.option_context("display.width", 200, "display.max_rows", 500):
+             wait_bars=a.wait_bars, vwap_mode=a.vwap_mode, fee=a.fee, slip=a.slip, tds=a.tds,
+             margin=a.margin, mmr=a.mmr, allow_long=not a.no_long, allow_short=not a.no_short)
+    if a.long_lev or a.short_lev:
+        ll = a.long_lev or a.short_lev
+        scenarios = [(_n(ll), _n(a.short_lev or ll))]
+    else:
+        scenarios = [(_n(float(x)), _n(float(x))) for x in a.leverages.split(",") if x.strip()]
+
+    summ, curves = run(a.data, [t.strip() for t in a.tfs.split(",")], p, scenarios, a.out)
+    with pd.option_context("display.width", 220, "display.max_rows", 1000, "display.max_columns", 50):
         print(summ.to_string(index=False))
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        top = summ.dropna(subset=["total_return_pct"]).sort_values("total_return_pct", ascending=False).head(6)
+        top = summ.dropna(subset=["total_pnl_inr"]).sort_values("total_pnl_inr", ascending=False).head(6)
         fig, ax = plt.subplots(figsize=(10, 5))
         for _, r in top.iterrows():
-            s = curves.get((r.symbol, r.tf))
+            s = curves.get((r.symbol, r.tf, r.lev))
             if s is not None:
-                ax.plot(s.index, (s.values - 1) * 100, label=f"{r.symbol} {r.tf}")
-        ax.set_ylabel("Return % (compounded, per-trade)")
+                ax.plot(pd.to_datetime(s.index), s.values, label=f"{r.symbol} {r.tf} {r.lev}")
+        ax.set_ylabel(f"Cumulative P&L (Rs), margin Rs{a.margin:g}/trade")
         ax.set_title("Brahmastra - top equity curves")
         ax.legend()
         ax.grid(alpha=.3)
         fig.tight_layout()
         fig.savefig(os.path.join(a.out, "equity_top.png"), dpi=130)
-    except Exception as e:  # plotting is optional
+    except Exception as e:
         print("plot skipped:", e)
+
+
+def _n(x):
+    return int(x) if float(x).is_integer() else x
 
 
 if __name__ == "__main__":
