@@ -47,7 +47,7 @@ on:
         required: false
         default: "10"
       stop_loss:
-        description: "Stop-loss % of price (0 = off, ignored in hold modes)"
+        description: "Stop-loss: 4 = 4% of price | pivot = exit when pivot level breaks | pivot,4 = whichever first | 0 = off (not used in hold modes)"
         required: false
         default: "0"
       take_profit:
@@ -63,7 +63,7 @@ on:
         required: false
         default: "0-0"
       scan:
-        description: "Pump-dump scan: 0 = off. 40 = coins with >=40% pump AND >=40% dump. Full format: 40,gate,300,15 (pct,exchange,max scan,max test). Exchange in Pair box (@) wins"
+        description: "Pump/dump scan: 0 = off. 40 = coins with a 40%+ PUMP or DUMP inside 24h. Full: pct,exchange,maxscan,maxtest,hours,rotate e.g. 40,gate,300,15,24,1 (rotate 1 = one coin at a time, failed coin dropped)"
         required: false
         default: "0"
 
