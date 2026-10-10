@@ -1,54 +1,77 @@
 #!/usr/bin/env python3
 """
-Download 5m OHLCV history from MEXC or Gate.io public APIs (no API key needed)
-and save as data/SYMBOL.csv for brahmastra_backtest.py.
+Download OHLCV history from MEXC or Gate.io public APIs (no API key needed)
+and save as data/SYMBOL_exchange.csv for brahmastra_backtest.py.
 
-Usage (run on YOUR computer, needs: pip install requests pandas):
-  python fetch_data.py --exchange mexc --symbols BTC_USDT,ETH_USDT,SOL_USDT --days 365
-  python fetch_data.py --exchange gate --symbols BTC_USDT,ETH_USDT --days 365
+  python fetch_data.py --exchange mexc --symbols BTC_USDT,ETH_USDT --days 365
+  python fetch_data.py --exchange gate --symbols BTC_USDT --days 30
+  python fetch_data.py --exchange gate --symbols BTC_USDT --days 365 --interval 1h
 
-Symbols are written like BASE_QUOTE. Downloads 5m candles (the backtester builds
-15m/1h/4h/1d/1w/1M from them). 365 days of 5m = ~105k candles per coin.
-NOTE: written from the exchanges' public API docs; not run against the live
-APIs from the build environment (blocked there) - if an error shows up, send it.
+IMPORTANT (Gate): Gate only serves the last ~10,000 candles per interval, so
+5m data reaches back only ~34 days. For longer history use --interval 1h
+(~1 year) or 4h/1d, or use MEXC. The backtester handles any base interval
+(timeframes smaller than the base interval are skipped automatically).
 """
 import argparse
 import os
+import sys
 import time
 
 import pandas as pd
 import requests
 
 S = requests.Session()
-S.headers["User-Agent"] = "brahmastra-backtest/1.0"
+S.headers["User-Agent"] = "brahmastra-backtest/1.1"
+
+SEC = {"5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
+MEXC_IV = {"5m": "5m", "15m": "15m", "1h": "60m", "4h": "4h", "1d": "1d"}
+GATE_MAX_BACK = 9800  # Gate serves at most 10,000 candles back
 
 
-def mexc(sym, start_ms, end_ms):
+def get_json(url, params):
+    r = S.get(url, params=params, timeout=20)
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:300]}")
+    return r.json()
+
+
+def mexc(sym, start_ms, end_ms, iv):
     url = "https://api.mexc.com/api/v3/klines"
     pair = sym.replace("_", "")
+    step = SEC[iv] * 1000
     rows, t = [], start_ms
     while t < end_ms:
-        r = S.get(url, params=dict(symbol=pair, interval="5m", startTime=t, limit=500), timeout=20)
-        r.raise_for_status()
-        k = r.json()
+        k = get_json(url, dict(symbol=pair, interval=MEXC_IV[iv], startTime=t, limit=500))
         if not k:
             break
         rows += [(x[0], x[1], x[2], x[3], x[4], x[5]) for x in k]
-        t = k[-1][0] + 5 * 60 * 1000
+        nt = k[-1][0] + step
+        if nt <= t:
+            break
+        t = nt
         time.sleep(0.12)
     return rows
 
 
-def gate(sym, start_ms, end_ms):
+def gate(sym, start_ms, end_ms, iv):
     url = "https://api.gateio.ws/api/v4/spot/candlesticks"
+    sec = SEC[iv]
+    earliest = end_ms - GATE_MAX_BACK * sec * 1000
+    if start_ms < earliest:
+        days = GATE_MAX_BACK * sec / 86400
+        print(f"  note: Gate keeps only ~{days:.0f} days of {iv} candles -> downloading that much "
+              f"(use --interval 1h/4h/1d or MEXC for longer history)")
+        start_ms = earliest
     rows, t = [], start_ms // 1000
-    step = 5 * 60 * 900  # 900 candles per request (max 1000)
-    while t < end_ms // 1000:
-        to = min(t + step, end_ms // 1000)
-        r = S.get(url, params={"currency_pair": sym, "interval": "5m", "from": t, "to": to}, timeout=20)
-        r.raise_for_status()
-        # Gate row: [ts, quote_vol, close, high, low, open, base_vol, closed]
-        rows += [(int(x[0]) * 1000, x[5], x[3], x[4], x[2], x[6]) for x in r.json()]
+    end_s = end_ms // 1000
+    while t < end_s:
+        to = min(t + sec * 900, end_s)  # < 1000 candles per request
+        data = get_json(url, {"currency_pair": sym, "interval": iv, "from": t, "to": to})
+        # Gate row: [ts, quote_vol, close, high, low, open, base_vol, window_closed]
+        for x in data:
+            if len(x) > 7 and str(x[7]).lower() == "false":
+                continue  # skip the still-forming candle
+            rows.append((int(x[0]) * 1000, x[5], x[3], x[4], x[2], x[6]))
         t = to + 1
         time.sleep(0.12)
     return rows
@@ -60,6 +83,7 @@ def main():
     ap.add_argument("--exchange", choices=["mexc", "gate"])
     ap.add_argument("--symbols", help="comma list, e.g. BTC_USDT,ETH_USDT")
     ap.add_argument("--days", type=int, default=365)
+    ap.add_argument("--interval", choices=list(SEC), default="5m")
     ap.add_argument("--out", default="data")
     a = ap.parse_args()
     if a.config:
@@ -70,22 +94,32 @@ def main():
         a.symbols = a.symbols or ",".join(d.get("symbols", []))
         a.days = d.get("days", a.days) if a.days == 365 else a.days
         a.out = d.get("folder", a.out) if a.out == "data" else a.out
+        if a.interval == "5m" and d.get("interval") in SEC:
+            a.interval = d["interval"]
     if not a.exchange or not a.symbols:
         ap.error("need --exchange and --symbols (or --config)")
+
     os.makedirs(a.out, exist_ok=True)
     end = int(time.time() * 1000)
     start = end - a.days * 86400 * 1000
     fn = mexc if a.exchange == "mexc" else gate
-    for sym in [s.strip().upper() for s in a.symbols.split(",")]:
+    ok = 0
+    for sym in [s.strip().upper() for s in a.symbols.split(",") if s.strip()]:
         try:
-            rows = fn(sym, start, end)
+            rows = fn(sym, start, end, a.interval)
         except Exception as e:
             print(f"{sym}: FAILED -> {e}")
+            continue
+        if not rows:
+            print(f"{sym}: FAILED -> no candles returned")
             continue
         df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
         df = df.drop_duplicates("timestamp").sort_values("timestamp")
         df.to_csv(os.path.join(a.out, f"{sym.replace('_', '')}_{a.exchange}.csv"), index=False)
-        print(f"{sym}: {len(df)} candles saved")
+        print(f"{sym}: {len(df)} candles saved ({a.interval})")
+        ok += 1
+    if ok == 0:
+        sys.exit("No data downloaded - see errors above.")
 
 
 if __name__ == "__main__":
