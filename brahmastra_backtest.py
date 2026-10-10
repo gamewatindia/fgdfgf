@@ -2,32 +2,36 @@
 """
 BRAHMASTRA STRATEGY - Backtest engine (futures style: fixed margin + leverage)
 ==============================================================================
-Rules:
+Core rules:
  1. Supertrend (ATR 20, mult 2) flips direction and the candle CLOSES beyond the
-    line -> this is the "signal candle" (C). On a following candle the trade
-    triggers when price breaks the HIGH of C (long) / LOW of C (short).
+    line -> "signal candle" (C). On a following candle the trade triggers when
+    price breaks the HIGH of C (long) / LOW of C (short).
  2. MACD (12,26,9) crossover in the trade direction, within `macd_lookback`
     candles before C, at C, or after C (before entry).
  3. VWAP (default "reversal"): long only if price was ALREADY BELOW VWAP before
     the signal candle, short only if ALREADY ABOVE ("trend" mode = opposite).
- Exit:
-    - SL  : low of the candle BEFORE the signal candle (long) / its high (short)
-    - TP  : Supertrend flips against the trade OR opposite MACD crossover,
-            confirmed on candle close (exit at that close).
-    - LIQUIDATION: if price reaches the liquidation price before the SL, the
-            whole margin is lost.
+
+Defaults reproduce the original Brahmastra exactly:
+    exit_mode=flip  (exit on Supertrend flip / opposite MACD cross, at candle close)
+    sl_mode=prev    (SL = low/high of the candle BEFORE the signal candle)
+
+Optional improvements (all off by default, used by optimize.py):
+    exit_mode=rr    fixed take-profit at tp_r x risk (only SL / TP exits)
+    exit_mode=both  fixed TP plus the flip/MACD exits
+    sl_mode=atr     SL = entry -/+ sl_atr x ATR(20) of the signal candle
+    be_r=1.0        after price moves +1R, move SL to breakeven (+costs)
+    htf_mult=4      only trade in the direction of the Supertrend of a candle
+                    4x bigger (e.g. 1h trades follow the 4h trend); uses only
+                    CLOSED higher-timeframe candles (no look-ahead)
 
 Money model: every trade uses a fixed MARGIN (default Rs 1000, no compounding).
-Position size = margin x leverage. P&L(Rs) = margin x leverage x net price move,
-where net price move already includes fees + slippage on the full notional.
-Liquidation price = entry x (1 -/+ (1/leverage - maintenance_margin)).
+P&L(Rs) = margin x leverage x net price move (fees+slippage on full notional).
+Liquidation price = entry x (1 -/+ (1/leverage - maintenance_margin)); if it is
+hit before the SL the whole margin is lost.
 
 No look-ahead: conditions use candles closed before the entry candle; entry is a
-stop-entry filled at max(open, trigger) (long). If SL and entry occur in the same
-candle, SL is assumed hit (conservative).
-
-Data: CSV per symbol in a folder, columns: timestamp,open,high,low,close,volume
-(timestamp = unix seconds / ms, or ISO string, UTC).
+stop-entry filled at max(open, trigger) (long). If SL and entry (or SL and TP)
+occur in the same candle, SL is assumed hit first (conservative).
 """
 import argparse
 import glob
@@ -42,6 +46,7 @@ TF_RULES = {
     "1d": "1D", "1w": "W-MON", "1M": "MS",
 }
 TF_MINUTES = {"5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440, "1w": 10080, "1M": 43200}
+OHLCV = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
 
 
 # ----------------------------------------------------------------- data ----
@@ -63,9 +68,7 @@ def load_csv(path):
 
 
 def resample(df, tf):
-    return df.resample(TF_RULES[tf], label="left", closed="left").agg(
-        {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
-    ).dropna(subset=["open", "close"])
+    return df.resample(TF_RULES[tf], label="left", closed="left").agg(OHLCV).dropna(subset=["open", "close"])
 
 
 # ----------------------------------------------------------- indicators ----
@@ -88,7 +91,7 @@ def supertrend(df, period=20, mult=2.0):
             d[i] = -1
         else:
             d[i] = d[i - 1]
-    return d, np.where(d == 1, flb, fub)
+    return d, np.where(d == 1, flb, fub), atr
 
 
 def macd_cross(close, fast=12, slow=26, sig=9):
@@ -119,16 +122,40 @@ def vwap(df, tf):
     return (pv / vv.replace(0, np.nan)).fillna(tp).values
 
 
+def prepare(df, tf, st_period=20, st_mult=2.0, htf_mults=()):
+    """Indicator arrays reused across many backtest runs (speed for the optimizer)."""
+    d, _, atr = supertrend(df, st_period, st_mult)
+    prep = dict(d=d, atr=atr, mc=macd_cross(df["close"]), vw=vwap(df, tf), htf={})
+    mins = TF_MINUTES[tf]
+    for m in htf_mults:
+        if not m:
+            continue
+        hd = df.resample(f"{int(mins * m)}min", label="left", closed="left").agg(OHLCV).dropna(subset=["open", "close"])
+        if len(hd) <= st_period + 5:
+            continue
+        dd, _, _ = supertrend(hd, st_period, st_mult)
+        # direction of the last COMPLETED higher-timeframe candle (shift by one) -> no look-ahead
+        s = pd.Series(dd, index=hd.index).shift(1)
+        prep["htf"][m] = s.reindex(df.index, method="ffill").fillna(0).values.astype(int)
+    return prep
+
+
 # ------------------------------------------------------------- backtest ----
-def backtest(df, tf, p):
+def backtest(df, tf, p, prep=None):
     n = len(df)
     if n < 60:
         return []
     o, h, l, c = (df[k].values for k in ("open", "high", "low", "close"))
     ts = df.index
-    d, _ = supertrend(df, p["st_period"], p["st_mult"])
-    mc = macd_cross(df["close"])
-    vw = vwap(df, tf)
+    htf_mult = p.get("htf_mult", 0)
+    if prep is None or (htf_mult and htf_mult not in prep["htf"]):
+        prep = prepare(df, tf, p["st_period"], p["st_mult"], (htf_mult,) if htf_mult else ())
+    d, atr, mc, vw = prep["d"], prep["atr"], prep["mc"], prep["vw"]
+    htf = prep["htf"].get(htf_mult) if htf_mult else None
+    if htf_mult and htf is None:
+        return []                                   # higher-timeframe filter impossible on this data
+    exit_mode = p.get("exit_mode", "flip")
+    tp_r, sl_mode, sl_atr, be_r = p.get("tp_r", 1.0), p.get("sl_mode", "prev"), p.get("sl_atr", 2.0), p.get("be_r", 0)
     slip, fee, tds = p["slip"] / 100, p["fee"] / 100, p["tds"] / 100
     margin, mmr = p["margin"], p["mmr"] / 100
     lb, wait = p["macd_lookback"], p["wait_bars"]
@@ -146,13 +173,12 @@ def backtest(df, tf, p):
             xpx = px * (1 - slip * s)
             net = s * (xpx / pos["entry"] - 1) - 2 * fee - tds   # costs on full notional
             pnl = max(margin * lev * net, -margin)               # can never lose more than margin
-        risk = abs(pos["entry"] - pos["sl"]) / pos["entry"]
         trades.append(dict(
             side="LONG" if s == 1 else "SHORT", lev=lev,
             entry_time=ts[pos["i"]], exit_time=ts[i], entry=pos["entry"], exit=xpx,
-            sl=pos["sl"], liq=pos["liq"], exit_reason=why, bars=i - pos["i"],
-            sl_pct=risk * 100, price_net_pct=net * 100, pnl_inr=pnl,
-            roi_margin_pct=pnl / margin * 100, R=(net / risk) if risk > 0 else np.nan))
+            sl=pos["sl0"], liq=pos["liq"], exit_reason=why, bars=i - pos["i"],
+            sl_pct=pos["risk"] * 100, price_net_pct=net * 100, pnl_inr=pnl,
+            roi_margin_pct=pnl / margin * 100, R=(net / pos["risk"]) if pos["risk"] > 0 else np.nan))
         pos = None
 
     for i in range(start, n):
@@ -179,16 +205,24 @@ def backtest(df, tf, p):
                     ok = c[i - 1] > vw[i - 1] if s == 1 else c[i - 1] < vw[i - 1]
                 if not ok:
                     continue
+                if htf is not None and htf[i] != s:                   # higher-timeframe trend filter
+                    continue
                 raw = max(o[i], st["trigger"]) if s == 1 else min(o[i], st["trigger"])
                 entry = raw * (1 + slip * s)
-                sl = st["sl"]
-                if (sl >= entry if s == 1 else sl <= entry):
-                    sl = st["sl_alt"]
+                if sl_mode == "atr":
+                    sl = entry - s * sl_atr * atr[st["C"]]
+                else:
+                    sl = st["sl"]
+                    if (sl >= entry if s == 1 else sl <= entry):
+                        sl = st["sl_alt"]
                 if (sl >= entry if s == 1 else sl <= entry):
                     continue
+                risk_abs = abs(entry - sl)
+                tp = entry + s * tp_r * risk_abs if exit_mode in ("rr", "both") else None
                 lev = p["lev_long"] if s == 1 else p["lev_short"]
                 liq = entry * (1 - s * max(1.0 / lev - mmr, 1e-9))
-                pos = dict(side=s, i=i, entry=entry, sl=sl, lev=lev, liq=liq)
+                pos = dict(side=s, i=i, entry=entry, sl=sl, sl0=sl, lev=lev, liq=liq,
+                           risk_abs=risk_abs, risk=risk_abs / entry, tp=tp, be=False)
                 setups[s] = None
                 break
 
@@ -200,17 +234,25 @@ def backtest(df, tf, p):
             else:
                 stop = min(pos["sl"], pos["liq"])
                 hit, is_liq = h[i] >= stop, pos["liq"] <= pos["sl"]
+            later = i > pos["i"]                # TP / breakeven are only evaluated after the entry bar
             if hit:
                 if is_liq:
                     close_trade(i, stop, "LIQUIDATION", liq=True)
                 else:
-                    gap = i > pos["i"]
-                    fill = (min(o[i], stop) if s == 1 else max(o[i], stop)) if gap else stop
-                    close_trade(i, fill, "SL")
-            elif d[i] == -s and d[i - 1] == s:
+                    fill = (min(o[i], stop) if s == 1 else max(o[i], stop)) if later else stop
+                    close_trade(i, fill, "SL_BE" if pos["be"] else "SL")
+            elif later and pos["tp"] is not None and (h[i] >= pos["tp"] if s == 1 else l[i] <= pos["tp"]):
+                fill = max(o[i], pos["tp"]) if s == 1 else min(o[i], pos["tp"])
+                close_trade(i, fill, "TP_RR")
+            elif exit_mode != "rr" and d[i] == -s and d[i - 1] == s:
                 close_trade(i, c[i], "TP_SUPERTREND")
-            elif mc[i] == -s:
+            elif exit_mode != "rr" and mc[i] == -s:
                 close_trade(i, c[i], "TP_MACD")
+            elif be_r and later and not pos["be"] and (
+                    h[i] >= pos["entry"] + be_r * pos["risk_abs"] if s == 1
+                    else l[i] <= pos["entry"] - be_r * pos["risk_abs"]):
+                pos["be"] = True                # from the next candle the SL sits at breakeven (+costs)
+                pos["sl"] = pos["entry"] * (1 + s * (2 * fee + 2 * slip))
 
         if d[i] != d[i - 1]:                    # ---- arm new setup at close of bar i
             s = int(d[i])
@@ -259,9 +301,10 @@ def run(data_dir, tfs, p, scenarios, outdir):
             if TF_MINUTES[tf] < base_min:
                 continue
             df = resample(base, tf)
+            prep = prepare(df, tf, p["st_period"], p["st_mult"], (p.get("htf_mult", 0),))
             for ll, sl_ in scenarios:
                 q = dict(p, lev_long=ll, lev_short=sl_)
-                tr = backtest(df, tf, q)
+                tr = backtest(df, tf, q, prep)
                 s, cum = stats(tr, df)
                 lev_name = f"{ll}x" if ll == sl_ else f"L{ll}x/S{sl_}x"
                 rows.append(dict(symbol=sym, tf=tf, lev=lev_name, bars=len(df), **s))
@@ -286,6 +329,12 @@ def main():
     ap.add_argument("--macd-lookback", type=int, default=2)
     ap.add_argument("--wait-bars", type=int, default=3, help="candles after signal candle in which breakout may trigger")
     ap.add_argument("--vwap-mode", choices=["reversal", "trend"], default="reversal")
+    ap.add_argument("--exit-mode", choices=["flip", "rr", "both"], default="flip")
+    ap.add_argument("--tp-r", type=float, default=1.0, help="take-profit in R (for exit-mode rr/both)")
+    ap.add_argument("--sl-mode", choices=["prev", "atr"], default="prev")
+    ap.add_argument("--sl-atr", type=float, default=2.0, help="SL distance in ATRs (sl-mode atr)")
+    ap.add_argument("--be-r", type=float, default=0.0, help="move SL to breakeven after +N R (0 = off)")
+    ap.add_argument("--htf-mult", type=int, default=0, help="trend filter from a timeframe N times bigger (0 = off)")
     ap.add_argument("--margin", type=float, default=1000.0, help="Rs margin per trade")
     ap.add_argument("--leverages", default="5,10", help="comma list; each value is run as a separate scenario (both sides)")
     ap.add_argument("--long-lev", type=float, help="optional: fixed long leverage (with --short-lev) instead of --leverages")
@@ -308,7 +357,9 @@ def main():
             "tfs": ",".join(g("backtest", "timeframes") or []) or None,
             "st_period": g("strategy", "supertrend_period"), "st_mult": g("strategy", "supertrend_multiplier"),
             "macd_lookback": g("strategy", "macd_lookback"), "wait_bars": g("strategy", "wait_bars"),
-            "vwap_mode": g("strategy", "vwap_mode"),
+            "vwap_mode": g("strategy", "vwap_mode"), "exit_mode": g("strategy", "exit_mode"),
+            "tp_r": g("strategy", "tp_r"), "sl_mode": g("strategy", "sl_mode"), "sl_atr": g("strategy", "sl_atr"),
+            "be_r": g("strategy", "be_r"), "htf_mult": g("strategy", "htf_mult"),
             "no_long": (g("strategy", "allow_long") is False) or None,
             "no_short": (g("strategy", "allow_short") is False) or None,
             "fee": g("costs", "fee_pct"), "slip": g("costs", "slippage_pct"), "tds": g("costs", "tds_pct"),
@@ -319,8 +370,10 @@ def main():
     a = ap.parse_args()
 
     p = dict(st_period=a.st_period, st_mult=a.st_mult, macd_lookback=a.macd_lookback,
-             wait_bars=a.wait_bars, vwap_mode=a.vwap_mode, fee=a.fee, slip=a.slip, tds=a.tds,
-             margin=a.margin, mmr=a.mmr, allow_long=not a.no_long, allow_short=not a.no_short)
+             wait_bars=a.wait_bars, vwap_mode=a.vwap_mode, exit_mode=a.exit_mode, tp_r=a.tp_r,
+             sl_mode=a.sl_mode, sl_atr=a.sl_atr, be_r=a.be_r, htf_mult=a.htf_mult,
+             fee=a.fee, slip=a.slip, tds=a.tds, margin=a.margin, mmr=a.mmr,
+             allow_long=not a.no_long, allow_short=not a.no_short)
     if a.long_lev or a.short_lev:
         ll = a.long_lev or a.short_lev
         scenarios = [(_n(ll), _n(a.short_lev or ll))]
