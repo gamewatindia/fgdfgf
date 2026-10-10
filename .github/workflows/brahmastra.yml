@@ -1,0 +1,68 @@
+name: Brahmastra Backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      exchange:
+        description: "Exchange to download data from"
+        type: choice
+        options: [mexc, gate]
+        default: mexc
+      symbols:
+        description: "Comma separated pairs (BASE_QUOTE)"
+        type: string
+        default: "BTC_USDT,ETH_USDT,SOL_USDT,XRP_USDT,BNB_USDT"
+      days:
+        description: "Days of 5m history to download"
+        type: string
+        default: "365"
+      vwap_mode:
+        description: "reversal = long below VWAP / short above; trend = opposite"
+        type: choice
+        options: [reversal, trend]
+        default: reversal
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install pandas numpy requests pyyaml matplotlib
+
+      - name: Download data
+        env:
+          EXCHANGE: ${{ inputs.exchange }}
+          SYMBOLS: ${{ inputs.symbols }}
+          DAYS: ${{ inputs.days }}
+        run: python fetch_data.py --exchange "$EXCHANGE" --symbols "$SYMBOLS" --days "$DAYS" --out data
+
+      - name: Run backtest
+        env:
+          VWAP_MODE: ${{ inputs.vwap_mode }}
+        run: python brahmastra_backtest.py --config config.yml --data data --out results --vwap-mode "$VWAP_MODE" | tee results_console.txt
+
+      - name: Show summary in run page
+        if: always()
+        run: |
+          if [ -f results_console.txt ]; then
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat results_console.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: brahmastra-results
+          path: |
+            results/
+            results_console.txt
+          if-no-files-found: warn
