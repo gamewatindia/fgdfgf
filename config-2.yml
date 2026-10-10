@@ -1,0 +1,34 @@
+# Brahmastra strategy - settings
+# Run:  python fetch_data.py --config config.yml
+#       python brahmastra_backtest.py --config config.yml
+# Command-line flags override values in this file.
+
+data:
+  exchange: mexc            # mexc | gate
+  symbols: [BTC_USDT, ETH_USDT, SOL_USDT, XRP_USDT, BNB_USDT]
+  days: 365                 # history to download
+  interval: 5m              # 5m | 15m | 1h | 4h | 1d  (Gate 5m = only ~34 days)
+  folder: data              # where CSVs are saved / read from
+
+backtest:
+  timeframes: [5m, 15m, 1h, 4h, 1d, 1w, 1M]
+  output_folder: results
+
+strategy:
+  supertrend_period: 20
+  supertrend_multiplier: 2.0
+  macd_lookback: 2          # accept MACD cross this many candles BEFORE the signal candle (and any time after it, until entry)
+  wait_bars: 3              # candles after signal candle in which the high/low breakout may trigger (1 = strictly next candle)
+  vwap_mode: reversal       # reversal: long if price already BELOW VWAP, short if already ABOVE | trend: long above, short below
+  allow_long: true
+  allow_short: true
+
+leverage:
+  margin_inr: 1000          # fixed margin per trade (Rs), no compounding
+  leverages: [5, 10]        # each value is tested as a separate scenario (long and short)
+  maintenance_margin_pct: 0.5   # used for liquidation price
+
+costs:                      # charged on the FULL position size (margin x leverage), per side
+  fee_pct: 0.02             # futures taker fee assumption - put your exchange's real fee
+  slippage_pct: 0.02
+  tds_pct: 0.0
