@@ -40,15 +40,14 @@ def mexc(sym, start_ms, end_ms, iv):
     pair = sym.replace("_", "")
     step = SEC[iv] * 1000
     rows, t = [], start_ms
+    # Explicit window (startTime AND endTime) per request: when only startTime is
+    # sent, some servers just return the latest 500 candles (this was the bug that
+    # gave only 500 candles per coin).
     while t < end_ms:
-        k = get_json(url, dict(symbol=pair, interval=MEXC_IV[iv], startTime=t, limit=500))
-        if not k:
-            break
-        rows += [(x[0], x[1], x[2], x[3], x[4], x[5]) for x in k]
-        nt = k[-1][0] + step
-        if nt <= t:
-            break
-        t = nt
+        te = min(t + 500 * step - 1, end_ms)
+        k = get_json(url, dict(symbol=pair, interval=MEXC_IV[iv], startTime=t, endTime=te, limit=500))
+        rows += [(x[0], x[1], x[2], x[3], x[4], x[5]) for x in k if t <= x[0] <= te]
+        t = te + 1
         time.sleep(0.12)
     return rows
 
@@ -116,7 +115,12 @@ def main():
         df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
         df = df.drop_duplicates("timestamp").sort_values("timestamp")
         df.to_csv(os.path.join(a.out, f"{sym.replace('_', '')}_{a.exchange}.csv"), index=False)
-        print(f"{sym}: {len(df)} candles saved ({a.interval})")
+        first = pd.to_datetime(df.timestamp.iloc[0], unit="ms")
+        last = pd.to_datetime(df.timestamp.iloc[-1], unit="ms")
+        got_days = (last - first).total_seconds() / 86400
+        print(f"{sym}: {len(df)} candles saved ({a.interval}), {first:%Y-%m-%d} -> {last:%Y-%m-%d}")
+        if got_days < a.days * 0.9 and not (a.exchange == "gate" and a.interval == "5m"):
+            print(f"  WARNING: asked {a.days} days but only got {got_days:.0f} days - exchange returned less history")
         ok += 1
     if ok == 0:
         sys.exit("No data downloaded - see errors above.")
